@@ -17,7 +17,7 @@
  * @module billion-context-dsh/state
  */
 import type { Session } from '@deepseek-ai/dsh-session';
-import { type CompressionState } from 'acp-kernel';
+import { type CompressionState } from './kernel/index.ts';
 export declare class AcpStateStore {
     /**
      * Live kernel states, capped by an LRU policy (issue #113): once the cap is

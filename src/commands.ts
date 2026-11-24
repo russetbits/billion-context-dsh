@@ -36,7 +36,7 @@ import {
 import { allLogMessages, eventsToCoreMessages, extractEventText, surfaceEventsOf } from './messages.ts'
 import { shadowedTokensViaMeter } from './host-tokens.ts'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
-import { defaultConfig } from 'acp-kernel'
+import { defaultConfig } from './kernel/index.ts'
 import { routeFor, windowSourceLabel } from './window.ts'
 import { PRESETS } from './presets.ts'
 

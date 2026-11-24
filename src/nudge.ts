@@ -18,7 +18,7 @@ import {
   type ContextBreakdown,
   type CoreMessage,
   type NudgeDecision,
-} from 'acp-kernel'
+} from './kernel/index.ts'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AcpStateStore } from './state.ts'

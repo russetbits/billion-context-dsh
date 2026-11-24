@@ -14,7 +14,7 @@
  * @module billion-context-dsh/config
  */
 
-import { defaultConfig, type Config } from 'acp-kernel'
+import { defaultConfig, type Config } from './kernel/index.ts'
 import { DEFAULT_FOLD_FLOOR_PCT, KV_BLOCK_TOKENS, type FoldPricing } from './region.ts'
 
 /** The kernel-facing knobs shared by the nudge path and the compress tool. */

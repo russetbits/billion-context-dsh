@@ -18,7 +18,7 @@
  */
 
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import { createInitialState, type CompressionBlock, type CompressionState } from 'acp-kernel'
+import { createInitialState, type CompressionBlock, type CompressionState } from './kernel/index.ts'
 import { DEFAULT_SESSION_CACHE_LIMIT, LruMap } from './lru.ts'
 import { rebuildBlockLedger } from './region.ts'
 import { sessionEventsOf } from './session-events.ts'

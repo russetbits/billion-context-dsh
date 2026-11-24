@@ -5,7 +5,7 @@
  * targets ranges by surface seq rather than by <acp> tags).
  * @module billion-context-dsh/nudge
  */
-import { type CompressionCore, type CompressionState, type ContextBreakdown, type CoreMessage, type NudgeDecision } from 'acp-kernel';
+import { type CompressionCore, type CompressionState, type ContextBreakdown, type CoreMessage, type NudgeDecision } from './kernel/index.ts';
 import { type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { AcpStateStore } from './state.ts';

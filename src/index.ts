@@ -35,7 +35,7 @@ import {
   type CompactionTrigger,
   type ManualCompactAgentContext,
 } from '@deepseek-ai/dsh-compaction'
-import { createCore, setDocCacheCap, type CompressionCore } from 'acp-kernel'
+import { createCore, setDocCacheCap, type CompressionCore } from './kernel/index.ts'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'

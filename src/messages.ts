@@ -11,7 +11,7 @@
  * @module billion-context-pi-dsh/messages
  */
 
-import type { CoreMessage } from 'acp-kernel'
+import type { CoreMessage } from './kernel/index.ts'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
 import { decodeAcpBlockLedger } from './block-ledger.ts'

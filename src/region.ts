@@ -19,7 +19,7 @@ import type { Session, SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-se
 // docs/dsh-porting-verification.md); tests/tool-pairing-host.test.ts guards it.
 import { CompactionId, compactCheckpointSource, toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
-import { defaultCountTokens } from 'acp-kernel'
+import { defaultCountTokens } from './kernel/index.ts'
 import {
   classifySurfaceEvent,
   checkpointCompactionIdOf,
@@ -1281,7 +1281,7 @@ export function deferCompressPairHide(
  * gate, index.ts:137/:163 — presence+identity, not payload diff), so
  * compressing the newest row of a scope makes that file come straight back,
  * while compressing a STALE copy of the same file is silent. Live-audited
- * shape (session-f25e4fad): EVERY injection row — baseline and worktree —
+ * shape (a live session): EVERY injection row — baseline and worktree —
  * carries `source.changes[].scope` = `"<dir>\u0000<file>"` (root
  * `.\u0000AGENTS.md`, worktree `worktrees/<name>\u0000AGENTS.md`), which is
  * stable across config tweaks unlike `baselineIdentity`. Tail-scan the log,

@@ -27,7 +27,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { CompactionEngine, type CompactionAgentContext, type CompactionResult, type CompactionTrigger, type ManualCompactAgentContext } from '@deepseek-ai/dsh-compaction';
-import { type CompressionCore } from 'acp-kernel';
+import { type CompressionCore } from './kernel/index.ts';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { AcpStateStore } from './state.ts';
 import { type ToolEnvironment } from './tools.ts';

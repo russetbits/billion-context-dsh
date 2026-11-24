@@ -10,7 +10,7 @@
  * @module billion-context-dsh/tools
  */
 import { type ToolDefinition } from '@deepseek-ai/dsh-tools';
-import { type CompressionCore, type SearchDoc } from 'acp-kernel';
+import { type CompressionCore, type SearchDoc } from './kernel/index.ts';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { Session } from '@deepseek-ai/dsh-session';
 import type { AcpStateStore } from './state.ts';
@@ -356,6 +356,21 @@ export declare const MAX_NOTE_WEIGHT_RATIO = 0.35;
  * between 2000 and ~2614 tokens was elected, paid for by a turn of writing, and then refused).
  */
 export declare const TYPICAL_HANDOFF_NOTE_TOKENS = 900;
+/**
+ * Hard ceiling on a stored handoff note, independent of the weight ratio.
+ *
+ * The ratio alone does not bound a note: at `MAX_NOTE_WEIGHT_RATIO` a 84K stretch
+ * admits 29K tokens, so it never fires on the folds that matter. Measured on a
+ * real 13-block session (2026-11-24) the notes averaged ~1.78K and peaked at 5.2K
+ * against a 900-token assumption — the stored area was underestimated by ~4K per
+ * block, and 23.1K of a 161K surface was handoff prose. The paper's control
+ * harness reports a 185-token median with p97.5 <= 2K, so a note past this
+ * ceiling is a narrative, not the "brief for the work ahead" the prompt asks for.
+ *
+ * Set above the 900-token typical so a good note is never clipped, and low enough
+ * to catch the 3-5K outliers that made the stored area grow.
+ */
+export declare const MAX_HANDOFF_NOTE_TOKENS = 1500;
 /**
  * Smallest stretch condense will elect: the smallest span that can carry a note this host's
  * models actually write inside the weight cap — `TYPICAL_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO`,

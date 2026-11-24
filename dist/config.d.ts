@@ -13,7 +13,7 @@
  * engine with no explicit config lands on 0.70/0.85, not 0.75/0.95.
  * @module billion-context-dsh/config
  */
-import { type Config } from 'acp-kernel';
+import { type Config } from './kernel/index.ts';
 import { type FoldPricing } from './region.ts';
 /** The kernel-facing knobs shared by the nudge path and the compress tool. */
 export interface KernelConfigInput {
