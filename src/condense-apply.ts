@@ -54,7 +54,7 @@ import {
   type FoldPricing,
   type ResolvedSurfaceRange,
 } from './region.ts'
-import { allLogMessages, attachmentsOfEvent, buildToolCallIndex, classifySurfaceEvent, eventsToCoreMessages, extractEventText, isAgentInstructionsRow, isCheckpointNode, isRealUserTurn, isSkillCatalogRow, surfaceEventsOf, toolCallsOf, withSummaryFramePrefix } from './messages.ts'
+import { allLogMessages, attachmentsOfEvent, buildToolCallIndex, classifySurfaceEvent, eventsToCoreMessages, extractEventText, isAgentInstructionsRow, isCheckpointNode, isRealUserTurn, isSkillCatalogRow, surfaceEventsOf, toolCallsOf, withSummaryFramePrefix, SUMMARY_FRAME_PREFIX } from './messages.ts'
 import { shadowedTokensViaMeter } from './host-tokens.ts'
 import { lastRequestInput, peakRequestInput, providerUsage, recordCompressCost, totalRequestInput } from './usage.ts'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
@@ -66,6 +66,94 @@ import { parseBoundary, CompressArgs, unwrapCompressArgs, validateContentItems }
 import { CondenseSpan, CondensePick, CondenseMiss, indexOfSurfaceSeq, condenseNoteBudget, condenseRangesOf, pickCondenseSpan } from './condense-elect.ts'
 import { formatPayback, condenseFloorRefusal, missingCondenseHeadings, condenseNoteGaps, MAX_NOTE_WEIGHT_RATIO, MAX_HANDOFF_NOTE_TOKENS, CONDENSE_BATCH_SPLIT_TOKENS, truncateNoteToCeiling, noteWeightRatio, noteWeightRejection } from './condense-note.ts'
 import { ToolEnvironment, TextOutput, requireAgent, resolveEffectiveWindow, guardedRowsInSpan, splitAroundProtected, splitPiecePosition, splitCoverageLine, liveCarrierRejectionNote, protectedRowRejectionNote, edgeRefForSeq } from './shared.ts'
+
+/** Strip the creation-time frame prefix the stored checkpoint node carries (region.ts framedSummary). */
+function stripSummaryFrame(text: string): string {
+  return text.startsWith(SUMMARY_FRAME_PREFIX)
+    ? text.slice(SUMMARY_FRAME_PREFIX.length).replace(/^\n/, '')
+    : text
+}
+
+/** The most recently landed durable block and its note as the note was WRITTEN (frame stripped). */
+interface RecentLandedNote {
+  ref: string
+  start: number
+  end: number
+  /** The surface seq of the block's checkpoint summary node (null when gone). */
+  summarySeq: number | null
+  note: string
+}
+
+/**
+ * The note of the NEWEST `compaction/summary` in the log (ledger order IS landing
+ * order), with its kernel block ref (`bN`) resolved through the registry (which
+ * synthesises refs for legacy blocks). Compares against what the ledger STORED —
+ * the framed summary — so a caller-side `withSummaryFramePrefix` cannot hide a match.
+ */
+function recentLandedBlockNote(session: Session): RecentLandedNote | undefined {
+  const ledger = rebuildBlockLedger(sessionEventsOf(session))
+  const last = ledger[ledger.length - 1]
+  if (last === undefined) return undefined
+  const registryEntry = blockRegistry(session).find((entry) => entry.blockId === last.blockId)
+  return {
+    ref: registryEntry?.kernelBlockId ?? 'b?',
+    start: last.start,
+    end: last.end,
+    summarySeq: last.summarySeq ?? null,
+    note: stripSummaryFrame(last.summary),
+  }
+}
+
+/** The refusal copy for a condense note byte-identical to the most recent landed block's note. */
+function duplicateCondenseNoteRejection(ref: string, start: number, end: number, noteTokens: number): string {
+  return 'compress: condense refused — this note is byte-identical to the note of the most recent landed block ' + ref
+    + ' (seqs ' + start + '..' + end + ').\n'
+    + 'A duplicate note adds nothing: every block stores its note verbatim, so this second copy makes the SAME ~' + noteTokens
+    + '-token text resident in every later request once per checkpoint node — pure permanent cost, zero new record.\n'
+    + 'Do ONE of:\n'
+    + '  - write a NEW note that describes THIS stretch only (what happened here, what to do next, the pointers a resumed session re-derives most expensively) and resend condense; or\n'
+    + '  - merge into the previous fold instead — distill through the block id: compress({ content: [{ startSeq: "' + ref
+    + '", endSeq: <endSeq>, summary: <a new, shorter note covering the merged span> }] }); naming the block ref on the start edge is what makes the call a tier-2 distillation.'
+}
+
+/**
+ * Duplicate-note verdict for the CONDENSE submission path. Refuses ONLY the harmful
+ * shape measured on the live session (measured 2026-11-26): the submitted note is
+ * identical to the most recent landed block's note AND the submitted number range
+ * INTERSECTS that block's coverage AND the fold does not absorb that block's
+ * checkpoint — i.e. two copies of the same note would co-exist on the surface.
+ * Absorption is exempt: when the fold takes the recent block's checkpoint into its
+ * shadowed span (what a distillation does), the old note leaves the surface with
+ * its block and a repeated text is harmless. Non-intersecting repeats are also
+ * exempt: the block-ref distill rhythm legitimately re-runs the same note across
+ * disjoint segments of one prefix. Returns null when the submission is acceptable.
+ *
+ * `spanAbsorbsCheckpoint` is what the CALLER resolved (an endSeq that names a
+ * block ref absorbs every older block's checkpoint), because at call time the
+ * handler has not yet balanced the edges. `startSeq`/`endSeq` are the raw
+ * submitted numbers, used only for the numeric intersect test.
+ */
+export function duplicateCondenseNoteVerdict(
+  session: Session,
+  items: ReadonlyArray<{ startSeq: number; endSeq: number; summary: string; spanAbsorbsCheckpoint?: boolean }>,
+): string | null {
+  const recent = recentLandedBlockNote(session)
+  if (recent === undefined) return null
+  const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim()
+  for (const item of items) {
+    const intersects = Math.max(recent.start, item.startSeq) <= Math.min(recent.end, item.endSeq)
+    if (!intersects) continue
+    if (item.spanAbsorbsCheckpoint === true) continue
+    const shadowedSpan = shadowedSeqsOf(session, item.startSeq, item.endSeq)
+    const absorbsRecent = recent.summarySeq !== null && shadowedSpan.includes(recent.summarySeq)
+    if (absorbsRecent) continue
+    const candidate = stripSummaryFrame(item.summary)
+    if (candidate === recent.note || normalize(candidate) === normalize(recent.note)) {
+      return duplicateCondenseNoteRejection(recent.ref, recent.start, recent.end, defaultCountTokens(withSummaryFramePrefix(candidate)))
+    }
+  }
+  return null
+}
 
 export async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: ToolRunContext): Promise<TextOutput> {
   const agent = requireAgent(exec)
@@ -303,6 +391,25 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   // validateContentItems for why the schema gate alone cannot do this).
   validateContentItems(args.content!)
 
+  // Duplicate-note gate (live another live session, 2026-11-26): two adjacent condense
+  // calls landed the SAME byte-identical note (932 chars) on two INTERSECTING
+  // number ranges, so every later request paid that full note once per checkpoint
+  // node — pure resident cost for zero new record. Refused BEFORE anything lands,
+  // so the model rewrites and resends without paying a second re-prefill.
+  // Condense-path only (an explicit `content` range legitimately reuses short
+  // one-line summaries). Full rationale in duplicateCondenseNoteVerdict.
+  if (condenseSynthesizedRange) {
+    const absorbs = condensePick !== undefined && (
+      condensePick.kind === 'distill'
+      || condensePick.spans.some((span) => span.endBlock !== null || span.carriers.length > 0)
+    )
+    const verdict = duplicateCondenseNoteVerdict(
+      session,
+      args.content!.map((item) => ({ startSeq: Number(item.startSeq), endSeq: Number(item.endSeq), summary: item.summary, spanAbsorbsCheckpoint: absorbs })),
+    )
+    if (verdict !== null) return { text: verdict }
+  }
+
   const ranges: Array<
     ResolvedSurfaceRange & {
       startSeq: number
@@ -472,7 +579,14 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   for (const range of args.content!) {
     let startSeq = parseBoundary(range.startSeq, byRef, session)
     let endSeq = parseBoundary(range.endSeq, byRef, session)
-    if (startSeq > endSeq) {
+    // Swap on POSITION, not value: after a compaction replace the surface is
+    // locally non-monotonic (a checkpoint node carrying a HIGH seq sits before
+    // residual nodes with LOWER seqs), so a model can legitimately ask for
+    // `12..9` meaning the positionally ascending span [12, 7, 8, 9] — swapping
+    // on value would invert it into a position-reversed call that the resolver
+    // rejects. A genuinely misplaced call (edges swapped positionally) still
+    // gets the mirrored note.
+    if (indexOfSurfaceSeq(session, startSeq) > indexOfSurfaceSeq(session, endSeq)) {
       swappedNotes.push(
         `  seqs ${startSeq}..${endSeq} were reversed — swapped to ${endSeq}..${startSeq}`,
       )
@@ -874,7 +988,15 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     const firstSpan = next.spans[0]!
     const lastSpan = next.spans[next.spans.length - 1]!
     const digest = next.carrierCount > 0 ? `, distilling ${next.carrierCount} block(s)` : ''
-    return `  Still foldable: ${next.eligibleRangeCount} range(s) remain — the foldable prefix is seqs ${firstSpan.start}..${lastSpan.end} (~${next.tokens} tokens${digest}). Fold it in a LATER turn: each call pays its own re-prefill and leaves its own barrier, so stacking folds inside one turn is the expensive way.`
+    // Multi-span batches are POSITION-ordered, so lastSpan.end can be numerically
+    // SMALLER than firstSpan.start (the last run carries a checkpoint with a high
+    // seq). Printing the raw numbers reads as a reversed/invalid range (live
+    // 2026-11-26: "seqs 2441..2423" after a tier-2 batch). When the value order
+    // disagrees with the position order, print each span separately and say so.
+    const prefixDesc = firstSpan.start <= lastSpan.end
+      ? `seqs ${firstSpan.start}..${lastSpan.end}`
+      : `${next.spans.length} span(s) in position order (checkpoint seqs sit high): ${next.spans.map((s) => `${s.start}..${s.end}`).join(', ')}`
+    return `  Still foldable: ${next.eligibleRangeCount} range(s) remain — the foldable prefix is ${prefixDesc} (~${next.tokens} tokens${digest}). Fold it in a LATER turn: each call pays its own re-prefill and leaves its own barrier, so stacking folds inside one turn is the expensive way.`
   })()
   const totalSkipped = skippedRanges + alreadyCompressedNotes.length + duplicateRangeNotes.length + rejectedNotes.length
   const failedLines = applied.result.errors.map((error) => `  ${error}`)

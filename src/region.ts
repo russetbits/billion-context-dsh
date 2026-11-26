@@ -218,13 +218,22 @@ function recoverStaleRange(session: Session, start: number, end: number): StaleR
   // this function hand back an interval whose edges are reversed in position, and
   // resolveSurfaceRange then threw `reversed range a..b` for two ascending seqs
   // (live 2026-11-25: condense picked 5062..5697 and failed twice, deterministically).
-  const plain = session.surface.nodes.filter((seq) => seq >= start && seq <= end).filter((seq) => {
+  // The value window is [min, max] of the two edges: on a locally non-monotonic
+  // surface a POSITIONALLY ascending requested span can read start > end in
+  // VALUES (live 2026-11-26, a live session — `recoverStaleRange(11, 9)`
+  // matched nothing because 11 > 9 and reported a fully-shadowed span for a
+  // span that had live content). Membership is a value question (which seqs
+  // fall between the two requested seqs numerically) and stays value-based;
+  // ORDER is positional and is preserved below (never sorted).
+  const lo = Math.min(start, end)
+  const hi = Math.max(start, end)
+  const plain = session.surface.nodes.filter((seq) => seq >= lo && seq <= hi).filter((seq) => {
     const event = eventAtOf(session, seq)!
     return !isCheckpointNode(event) && !isSystemNode(event)
   })
   if (plain.length === 0) {
     const coveringBlockIds = rebuildBlockLedger(sessionEventsOf(session))
-      .filter((entry) => entry.shadowedSeqs.some((seq) => seq >= start && seq <= end))
+      .filter((entry) => entry.shadowedSeqs.some((seq) => seq >= lo && seq <= hi))
       .map((entry) => entry.blockId)
     return { kind: 'already-compressed', coveringBlockIds }
   }
@@ -268,9 +277,16 @@ export function resolveSurfaceRange(
   end: number,
 ): ResolvedSurfaceRange {
   const nodes = session.surface.nodes
-  if (start > end) {
-    throw new Error(`billion-context-dsh: reversed range ${start}..${end}`)
-  }
+  // Positional order is the ONLY order a surface span is judged by: after a
+  // compaction replace the checkpoint node lands mid-array carrying a HIGHER
+  // seq than its neighbours, so a positionally ascending span can legitimately
+  // read `start > end` in VALUES (live 2026-11-25/26, a live session: a
+  // cut-around piece [368, 326] — positions 89→90, values inverted — threw
+  // "reversed range 368..326" here and poisoned every compress whose span was
+  // split around a guarded row; every downstream consumer — shadowedSeqsOf,
+  // isExactSurfaceSpan, the host's own surfaceOp replace — is positional too).
+  // A genuinely reversed call is caught by the POSITIONAL check below, which
+  // also covers the both-edges-missing path via the stale recovery.
   let requestedStartIdx = nodes.indexOf(start as SurfaceSeq)
   let requestedEndIdx = nodes.indexOf(end as SurfaceSeq)
   let recovered = false
@@ -304,11 +320,11 @@ export function resolveSurfaceRange(
   if (requestedStartIdx > requestedEndIdx) {
     throw new Error(`billion-context-dsh: reversed range ${start}..${end}`)
   }
-  // Belt-and-braces: the surface can be locally out of order after surface
-  // replacements, so index order alone does not guarantee value order.
-  if (start > end) {
-    throw new Error(`billion-context-dsh: reversed range ${start}..${end}`)
-  }
+  // Both edges sit on the surface in positional order — a value-inverted span
+  // here is a legal cut on a locally non-monotonic surface, not an error. The
+  // former value-order "belt-and-braces" throw was exactly the false rejection
+  // above; the shadowed slice and every durable write are positional, so no
+  // invariant is violated by returning it.
   // A boundary must be BOTH tool-pairing-balanced AND anchorable: the cut must
   // map onto kernel refs that name the shadowed span (bare-`${seq}` id, a
   // multi-call node's `${seq}#${callId}` sub-ids, or the empty-result fallback
@@ -338,7 +354,10 @@ export function resolveSurfaceRange(
   while (endIdx >= startIdx && !cleanAfter(endIdx)) {
     endIdx -= 1
   }
-  if (startIdx <= endIdx && nodes[startIdx]! <= nodes[endIdx]!) {
+  // Positional order only (see the header note on resolveSurfaceRange): the
+  // former `nodes[startIdx] <= nodes[endIdx]` value gate rejected legal
+  // positionally-ascending spans on a locally non-monotonic surface.
+  if (startIdx <= endIdx) {
     return recovered
       ? { start: nodes[startIdx]!, end: nodes[endIdx]!, recovered: true }
       : { start: nodes[startIdx]!, end: nodes[endIdx]! }
@@ -363,11 +382,11 @@ export function resolveSurfaceRange(
   while (endIdx < nodes.length - 1 && !cleanAfter(endIdx)) {
     endIdx += 1
   }
-  // Value order guard: the surface is locally non-monotonic after replacements
-  // (a checkpoint seq inserted ahead of older residual nodes), so index order
-  // alone is not enough — never return a span whose end seq is numerically
-  // BEFORE its start seq. The caller (nudge / compress) skips such a span.
-  if (cleanBefore(startIdx) && cleanAfter(endIdx) && nodes[startIdx]! <= nodes[endIdx]!) {
+  // Positional order only (see the header note on resolveSurfaceRange): the
+  // value-order guard here rejected legal positionally-ascending spans on a
+  // locally non-monotonic surface — the caller skips nothing; a positional
+  // span is shadowed positionally by every downstream consumer.
+  if (cleanBefore(startIdx) && cleanAfter(endIdx)) {
     return { start: nodes[startIdx]!, end: nodes[endIdx]! }
   }
   throw new Error(
@@ -400,7 +419,10 @@ export function isExactSurfaceSpan(
   end: number,
   declared: readonly number[],
 ): boolean {
-  if (start > end || declared.length === 0) return false
+  // Positional order only (see resolveSurfaceRange's header note); a span whose
+  // edges left the surface entirely is still refused by the positional
+  // comparison against the declared slice.
+  if (session.surface.nodes.indexOf(start as SurfaceSeq) > session.surface.nodes.indexOf(end as SurfaceSeq)) return false
   const nodes = session.surface.nodes
   const startIdx = nodes.indexOf(start as SurfaceSeq)
   const endIdx = nodes.indexOf(end as SurfaceSeq)
@@ -544,7 +566,12 @@ export function runCompactionTransaction(
   // compaction/start and compaction/summary and then leave a dangling start
   // (poisoning every later compress call) plus an orphan summary in the ledger.
   // Validating the edges up front keeps a bad range a clean, zero-write no-op.
-  if (input.start > input.end) {
+  // Positional order only (see resolveSurfaceRange's header note): the
+  // value check `start > end` rejected legal positionally-ascending spans on a
+  // locally non-monotonic surface and would have made every durable write there
+  // impossible. An edge missing from the SURFACE (but present in the log) is
+  // still caught by the isExactSurfaceSpan positional comparison below.
+  if (session.surface.nodes.indexOf(input.start as SurfaceSeq) > session.surface.nodes.indexOf(input.end as SurfaceSeq)) {
     throw new Error(`billion-context-dsh: reversed range ${input.start}..${input.end}`)
   }
   if (eventAtOf(session, input.start) === undefined || eventAtOf(session, input.end) === undefined) {

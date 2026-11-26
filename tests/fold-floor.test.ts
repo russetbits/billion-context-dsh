@@ -166,7 +166,7 @@ test('the refusal names WHICH gate failed and its arithmetic', () => {
   const floor = condenseFloorRefusal(base as never, 8000)
   assert.match(floor, /floor gate/, 'the capacity gate is named')
   assert.match(floor, /short by ~6000/, 'and the shortfall is printed')
-  assert.match(floor, /force:true/, 'the only compliant escape')
+  assert.match(floor, /force: ?true/, 'the only compliant escape, with the copyable call shape')
   assert.doesNotMatch(floor, /payback gate|cost gate/, 'the removed gates are gone entirely')
 
   // A pick that only REPORTS a slow payback (no gate can fail but capacity) is

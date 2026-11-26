@@ -148,7 +148,11 @@ export function condenseFloorRefusal(pick: CondensePick, floor: number): string 
   const head = `compress: condense refused seqs ${first.start}..${last.end} — the engine elected ${shape} totaling ${pick.tokens}t; folding them costs ${pick.foldCostTokens}t of re-prefill (pays back in ${payback}) and leaves ~${pick.keptTokens} live.\n`
   const lines: string[] = []
   if (!pick.gates.capacity) {
-    lines.push(`  · floor gate: ~${pick.keptTokens} live is under the working-set floor ~${floor} (short by ~${Math.max(0, floor - pick.keptTokens)}), so folding it strands the working set. Fold a SMALLER span instead — a fold leaves exactly as much room as it does NOT remove, so the widest available span is the one that strands it — or accept a shallow working set with force:true.`)
+    lines.push(`  · floor gate: ~${pick.keptTokens} live is under the working-set floor ~${floor} (short by ~${Math.max(0, floor - pick.keptTokens)}), so folding it strands the working set. Fold a SMALLER span instead — a fold leaves exactly as much room as it does NOT remove, so the widest available span is the one that strands it.`)
+    // 2026-11-26 live sessions: the earlier copy mentioned force in passing and the
+    // model never used it — the session stalled at high pressure. Make the bypass
+    // the EXPLICIT recommendation, with the exact call shape ready to copy.
+    lines.push(`  If you ACCEPT the smaller working set deliberately (operator judgement — imminent overflow qualifies), bypass with force: compress({ condense: { summary }, force: true }) — the floor exists to protect a shallow working set (arXiv 2611.05306 App. D), not to forbid compression.`)
   }
   if (lines.length === 0) {
     // No gate is actually failing (only reachable if a caller ignored the election):
@@ -334,6 +338,12 @@ export function noteWeightRejection(
   return (
     'compress: condense refused — your note is ~' + Math.round(ratio * 100) + '% of the ' + spanTokens + ' tokens it replaces (limit ' + Math.round(MAX_NOTE_WEIGHT_RATIO * 100) + '%), counted as it is stored (' + tokens + ' tokens including the summary frame prefix).\n'
       + 'That is a second copy, not a briefing: it stays resident in every later request, so the fold never pays back its one-time re-prefill.\n'
-      + 'Cut it to what a resumed session cannot re-derive: ## Task (verbatim), ## Now (next step + done-when), ## Pointers, ## Dead ends. Drop the running commentary. Nothing lands — rewrite the note and send it again.'
+      + 'Cut it to what a resumed session cannot re-derive: ## Task (verbatim), ## Now (next step + done-when), ## Pointers, ## Dead ends. Drop the running commentary. Nothing lands — rewrite the note and send it again.\n'
+      // 2026-11-26 live session (seq 606): a 1555-token span cannot carry the full
+      // 4-field brief inside 35% — the model gave up instead of retrying smaller.
+      // The gate is a WEIGHT ratio, not a length minimum: `validateContentItems`
+      // only requires a non-empty summary, and missing headings are advisories
+      // (the fold still lands), so a minimal note is a real escape when it fits.
+      + 'If this span is TOO SMALL to carry a full brief (a 4-field note cannot fit in 35% of a tiny span), fold it TOGETHER with an adjacent consumed span in one call (bigger span → lower note ratio), or write a minimal note — the only hard minimum is a non-empty summary; there is NO 50-character or skeleton gate, and missing ## headings only produce a warning while the fold still lands — as long as the note stays under 35% of the span.'
   )
 }

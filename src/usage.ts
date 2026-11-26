@@ -16,6 +16,7 @@
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { surfaceEventsOf } from './messages.ts'
 
 /** Cumulative per-session billing, in the host token-meter's own buckets. */
 export interface ProviderUsage {
@@ -97,7 +98,15 @@ export function lastRequestInput(session: Session): number {
  * and pairing them forges a tokenizer ratio the engine never observed (round-12 review Q2).
  */
 export function lastRequestUsage(session: Session): { tokens: number; seq: number } | undefined {
-  const events = session.snapshotEvents() as readonly SessionEvent[]
+  // Scan only SURFACE-visible assistant events, newest first. A full-log scan
+  // (snapshotEvents) can return an assistant row that a later durable replace
+  // has SHADOWED: the billed number still sits in the log, but the request it
+  // describes no longer represents the surface the caller is asking about —
+  // live 2026-11-26 a live session: after the hot reload the newest visible
+  // assistant billed 166,975 while a shadowed pre-fold row still read 198,141,
+  // so acp_status reported a stale +31K live. The surface (session.surface
+  // nodes → events) is the same thing the next request is built from.
+  const events = surfaceEventsOf(session) as readonly SessionEvent[]
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!
     if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') continue
