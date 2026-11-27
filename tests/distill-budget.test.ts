@@ -7,11 +7,12 @@
  * 常驻每个后续请求。
  *
  * Contracts:
- *   DB-1  T2（被吸收块全是 tier1）：超 0.6×基准截断 + advisory（保头砍尾）
- *   DB-2  T3（吸收含 tier2 块）：超 0.4×基准截断 + advisory
+ *   DB-1  T2（被吸收块全是 tier1）：超 0.75×基准截断 + advisory（保骨架砍叙事）
+ *   DB-2  T3（吸收含 tier2 块）：超 0.6×基准截断 + advisory
  *   DB-3  基准不可得（span 不吸收任何 active 块 checkpoint）→ fail-open 不截断
- *   DB-4  截断后剩余 <200t → 拒绝该项 + 引导文案（2026-11-27 三段下限后：
- *         band-2 120t..200t 放行原 note、band-3 <120t 拒绝，见 DB-7/DB-8）
+ *   DB-4  截断后剩余 <200t → 拒绝该项 + 引导文案（2026-11-27 二改：300t 绝对
+ *         下限吃掉旧三段带——ceiling 至少 300t，截断后 <200t 只剩 REJECT 一条路，
+ *         band-2「放行原 note」语义随信息优先口径一并废止，见 DB-7/DB-8 的改造）
  *   DB-5  普通 content（不吸收 checkpoint）不受预算影响
  *   DB-6  骨架 heading 在文件头部 → 保头砍尾保住 Task/Now
  */
@@ -31,7 +32,7 @@ import { appendAssistant, appendTurn, appendUser, longText } from './helpers.ts'
 const NOTE = '## Task\nFold the consumed prefix and keep the ledger honest — the consumed tool rows, the decisions taken and the state left behind.\n'
   + '## Now\nRe-measure the election against the shorter surface; done when every gate is named in the compress result and the remaining candidates are re-priced.\n'
 
-/** 长 note：每个 fixture 块的源摘要 ~400 tokens，让 0.6× 预算足够容纳一次
+/** 长 note：每个 fixture 块的源摘要 ~400 tokens，让 0.75× 预算足够容纳一次
  *  成功的截断（截断后 ≥200t）。DB-4（拒绝路径）单独用短 NOTE。 */
 const NOTE_BIG = '## Task\nFold the consumed prefix and keep the ledger honest — record every consumed tool row, the decisions taken, the verification readings already green and the exact state the next step inherits.\n'
   + '## Now\nRe-measure the election against the shorter surface; done when every gate is named in the compress result, the remaining candidates are re-priced, and the ledger reconciles against the block accounting.\n'
@@ -114,7 +115,7 @@ async function tierOneBlocks(session: Session, env: ToolEnvironment, blocks: num
 }
 
 // ---------------------------------------------------------------- DB-1
-test('DB-1: a T2 distill whose note exceeds 0.6× the absorbed tier-1 summary base is truncated with an advisory', async () => {
+test('DB-1: a T2 distill whose note exceeds 0.75× the absorbed tier-1 summary base is truncated with an advisory', async () => {
   const env = makeEnv()
   const session = Session.create('db1-t2-truncate')
   appendTurn(session, 1)
@@ -133,7 +134,7 @@ test('DB-1: a T2 distill whose note exceeds 0.6× the absorbed tier-1 summary ba
   assert.match(text, /distill note for seqs .*truncated to/, 'advisory names the truncation: ' + text)
   assert.match(text, /budget = source Σ/, 'advisory names the budget arithmetic: ' + text)
   // 落账的 summary 必须在预算内：先吸收两个 tier1 块的源摘要 tokens 作基准，
-  // 新块 tier 应为 2，且 stored tokens ≤ 0.6×基准。
+  // 新块 tier 应为 2，且 stored tokens ≤ 0.75×基准。
   const events = summaryEvents(session)
   const newEntry = blockRegistry(session)[2]
   assert.equal(newEntry?.tier, 2, 'the new block is tier 2')
@@ -144,8 +145,8 @@ test('DB-1: a T2 distill whose note exceeds 0.6× the absorbed tier-1 summary ba
   const storedText = (readCompactionSummary(events[2] as never).summary ?? []).map((b: { text?: string }) => b.text ?? '').join('')
   const storedTokens = defaultCountTokens(withSummaryFramePrefix(storedText))
   assert.ok(
-    storedTokens <= Math.floor(sourceTokens * 0.6),
-    `stored ~${storedTokens}t must fit the 0.6× budget of ~${sourceTokens}t`,
+    storedTokens <= Math.floor(sourceTokens * 0.75),
+    `stored ~${storedTokens}t must fit the 0.75× budget of ~${sourceTokens}t`,
   )
   // 保头：Task/Now heading 必须还在。
   assert.ok(storedText.includes('## Task'), 'the head (## Task) survives the tail cut')
@@ -156,14 +157,14 @@ test('DB-1: a T2 distill whose note exceeds 0.6× the absorbed tier-1 summary ba
 })
 
 // ---------------------------------------------------------------- DB-2
-test('DB-2: a T3 distill absorbing a tier-2 block is capped at 0.4× the base', async () => {
+test('DB-2: a T3 distill absorbing a tier-2 block is capped at 0.6× the base', async () => {
   const env = makeEnv()
   const session = Session.create('db2-t3-truncate')
   appendTurn(session, 1)
   await tierOneBlocks(session, env, 3, NOTE_BIG + ' ' + Array.from({ length: 120 }, (_, i) => `Detail line ${i}: the decisions, file paths and open objectives this block carries forward into the next turn, with the verification readings already green.`).join(' '))
-  // t1 摘要必须够大：t3 预算 = 0.4×(0.6×t1Σ)，要容 ≥200t 截断 → t1Σ ≥ ~1250t。
+  // t1 摘要必须够大：t3 预算 = 0.6×(0.75×t1Σ)，要容 ≥200t 截断 → t1Σ ≥ ~1250t。
   // 先蒸馏前两个 tier1 块 → tier2 块。t2 note 用 NOTE_BIG：base = t2 源摘要，
-  // 0.4×base 必须容得下一次 ≥200t 的截断（NOTE 太短会让 budget <200 走拒绝分支）。
+  // 0.6×base 必须容得下一次 ≥200t 的截断（NOTE 太短会让 budget <200 走拒绝分支）。
   const c1 = checkpointSeqOf(session, 0)
   const c2 = checkpointSeqOf(session, 1)
   const t2Text = await compressCall(session, env, 'db2-t2', {
@@ -176,9 +177,10 @@ test('DB-2: a T3 distill absorbing a tier-2 block is capped at 0.4× the base', 
   // 要求 boundaryKind==='block'（纯 seq 边即使覆盖 checkpoint 也产出 tier2）；
   // 且 outputTier = min(3, minTier(nested)+1)，混入 tier1 会降到 tier2，所以
   // 这里单蒸 tier2 块（b4）。bN = registry 下标 + 1（本 fixture 按序落账）。
-  // T3 预算 = 0.4×tier2 基准：本 fixture 的 tier2 基准 ~197t → 预算 ~79t
-  // < 200t 可用下限 → 拒绝路径（截断路径已由 DB-1 的 tier2 覆盖）。断言拒绝
-  // 文案点名 0.4 ratio（即吸收了 tier≥2 块）。
+  // T3 预算 = 0.6×tier2 基准：本 fixture 的 tier2 基准 ~197t → 118t，被 300t
+  // 绝对下限抬到 300t → 截断成功（~286t stored）。2026-11-27 二改：绝对下限让
+  // 「小源 T3 被拒」场景消失——拒绝只发生在源薄到 300t 下限也救不回来时。
+  // 这里断言截断路径 + advisory 点名 0.6 ratio（即吸收了 tier≥2 块）+ tier3 落账。
   const registryBefore = blockRegistry(session)
   // blockRegistry 每次调用都新建 entry 对象，必须按 blockId 定位而不是 indexOf。
   const t2Index = registryBefore.findIndex((entry) => entry.blockId === t2Entry.blockId)
@@ -188,10 +190,11 @@ test('DB-2: a T3 distill absorbing a tier-2 block is capped at 0.4× the base', 
   const text = await compressCall(session, env, 'db2-t3', {
     content: [{ startSeq: 'b' + (t2Index + 1), endSeq: 'b' + (t2Index + 1), summary: oversized }],
   })
-  assert.match(text, /REJECTED/, 'the T3 item is rejected (budget too small for a briefing): ' + text)
-  assert.match(text, /× 0\.4\)/, 'the ratio names 0.4 (a tier-2 source was absorbed): ' + text)
-  // 没有新块落账。
-  assert.equal(summaryEvents(session).length, before, 'nothing landed for the rejected T3 item')
+  assert.match(text, /Compressed 1 block/, 'the T3 distill lands (300t floor keeps the budget viable): ' + text)
+  assert.match(text, /× 0\.6, floor 300t/, 'the advisory names the 0.6 ratio AND the 300t absolute floor: ' + text)
+  const t3Entry = blockRegistry(session).filter((entry) => entry.tier === 3)
+  assert.equal(summaryEvents(session).length, before + 1, 'the tier-3 block landed')
+  assert.equal(t3Entry.length, 1, 'exactly one tier-3 block exists')
 })
 
 // ---------------------------------------------------------------- DB-3
@@ -219,26 +222,28 @@ test('DB-3: a span with no absorbed active checkpoint is fail-open (no truncatio
 })
 
 // ---------------------------------------------------------------- DB-4
-test('DB-4: a truncation that would leave <200 usable tokens REJECTS the item with guidance', async () => {
+// 2026-11-27 二改：300t 绝对下限吃掉了「小源被拒」场景——ceiling 至少 300t，
+// 截断产物 stored ≥ 300t > 200t 可用下限，REJECT 分支成为不可达防御代码。
+// DB-4 改为验证新语义：同一小源场景走 300t 下限截断成功。
+test('DB-4: a tiny source hits the 300t absolute floor and truncates to a viable briefing', async () => {
   const env = makeEnv()
-  const session = Session.create('db4-reject')
+  const session = Session.create('db4-floor')
   appendTurn(session, 1)
   await tierOneBlocks(session, env, 1)
   const checkpoint = checkpointSeqOf(session, 0)
-  // 源摘要很小（~NOTE 量级，几十 token），note 塞 2000t 叙事 → 0.6×基准后
-  // 剩余远低于 200t → 拒绝。
-  const filler = Array.from({ length: 200 }, (_, i) => `Filler line ${i}: the narrative this test wants rejected, alpha beta gamma delta epsilon zeta eta theta ${i}.`).join('\n')
+  // 源摘要很小（~NOTE 量级，几十 token）：0.75×基准 < 300t → 绝对下限抬到 300t；
+  // note 塞 2000t 叙事 → 截断到 ~300t stored（≥200t 可用）→ 截断成功。
+  const filler = Array.from({ length: 200 }, (_, i) => `Filler line ${i}: the narrative this test wants truncated, alpha beta gamma delta epsilon zeta eta theta ${i}.`).join('\n')
   const before = summaryEvents(session).length
   const text = await compressCall(session, env, 'db4', {
     content: [{ startSeq: String(checkpoint), endSeq: String(checkpoint), summary: NOTE + filler + '\n' }],
   })
-  assert.match(text, /REJECTED/, 'the item is rejected: ' + text)
-  assert.match(text, /below the ~120t minimum/, 'the guidance names the floor: ' + text)
-  assert.match(text, /Distill FEWER source blocks/, 'the guidance names the compliant move: ' + text)
-  // 没有新块落账。
-  assert.equal(summaryEvents(session).length, before, 'nothing landed for the rejected item')
-  // 旧 checkpoint 仍在 surface 上（未被动过）。
-  assert.ok(activeCheckpointSeqs(session).includes(checkpoint), 'the source block stays active')
+  assert.match(text, /Compressed 1 block/, 'the item lands via the 300t floor: ' + text)
+  assert.match(text, /floor 300t/, 'the advisory names the 300t absolute floor: ' + text)
+  assert.match(text, /truncated to/, 'the advisory names the truncation: ' + text)
+  // 落账且旧 checkpoint 被吸收。
+  assert.equal(summaryEvents(session).length, before + 1, 'the block landed')
+  assert.ok(!activeCheckpointSeqs(session).includes(checkpoint), 'the source block was absorbed')
 })
 
 // ---------------------------------------------------------------- DB-5
@@ -270,26 +275,31 @@ test('DB-6: the head-of-file skeleton headings survive the tail cut', async () =
   appendTurn(session, 1)
   await tierOneBlocks(session, env, 1)
   const checkpoint = checkpointSeqOf(session, 0)
-  // 源摘要 ≈ NOTE（~30t），预算 0.6× ≈ 十几 t——任何截断都只剩头部一两行。
-  // 用 Task/Now + 大 filler：截断后 Task 行必须幸存。
+  // 源摘要 ≈ NOTE（~30t）：0.75×基准 < 300t → 300t 绝对下限接管。用
+  // Task/Now + 大 filler：截断后 heading 行必须幸存（保骨架语义——heading 不丢，
+  // 被丢的是 heading 之后的叙事体行）。
   const filler = Array.from({ length: 100 }, (_, i) => `Filler line ${i}: alpha beta gamma delta epsilon zeta eta theta ${i}.`).join('\n')
   const text = await compressCall(session, env, 'db6', {
     content: [{ startSeq: String(checkpoint), endSeq: String(checkpoint), summary: '## Task\nFold the prefix.\n## Now\nWait.\n' + filler + '\n' }],
   })
-  // 剩余 <200t → 拒绝路径（DB-4 覆盖）；这里验证拒绝文案点名 budget。
-  assert.match(text, /REJECTED/, 'a tiny budget rejects: ' + text)
-  assert.match(text, /source summaries Σ/, 'the arithmetic is named: ' + text)
+  assert.match(text, /Compressed 1 block/, 'the 300t floor keeps the distill viable: ' + text)
+  assert.match(text, /floor 300t/, 'the advisory names the floor arithmetic: ' + text)
+  // 落账后 heading 必须还在。
+  const last = summaryEvents(session)[summaryEvents(session).length - 1]!
+  const storedText = (readCompactionSummary(last as never).summary ?? []).map((b: { text?: string }) => b.text ?? '').join('')
+  assert.ok(storedText.includes('## Task'), 'the ## Task heading survives the cut')
+  assert.ok(storedText.includes('## Now'), 'the ## Now heading survives the cut')
 })
 
 // ---------------------------------------------------------------- DB-7
-// 2026-11-27 lead 裁决的三段下限：band-2（120t..200t）接受原 note 不截断，
-// band-3（<120t）REJECT 且文案改为 120t 语义。
-test('DB-7: a ceiling in the 120t..200t band accepts the note UNTRUNCATED with an advisory', async () => {
+// 2026-11-27 二改：300t 绝对下限吃掉三段带——ceiling 至少 300t，band-2
+// 「放行原 note」语义废止；同一场景改走 300t 下限截断成功。
+test('DB-7: a small source lands on the 300t absolute floor (the band-2 pass-through is retired)', async () => {
   const env = makeEnv()
-  const session = Session.create('db7-band2')
+  const session = Session.create('db7-floor')
   appendTurn(session, 1)
-  // 源摘要 ~260t（0.6× → ceiling ~156t，落在 band-2）；note 超 ceiling 但
-  // 截断无意义（产物≈源大小），必须原样放行。
+  // 源摘要 ~260t（0.75× → ~195t < 300t → 绝对下限接管）；note 超 ceiling，
+  // 截断到 ~300t stored 落账（不再原样放行）。
   const sourceNote = NOTE_BIG + Array.from({ length: 8 }, (_, i) => `Source line ${i}: decision ${i} recorded with its path and its verification reading.`).join(' ')
   await tierOneBlocks(session, env, 1, sourceNote)
   const checkpoint = checkpointSeqOf(session, 0)
@@ -305,28 +315,30 @@ test('DB-7: a ceiling in the 120t..200t band accepts the note UNTRUNCATED with a
     content: [{ startSeq: String(checkpoint), endSeq: String(checkpoint), summary: note }],
   })
   void baseTokens
-  assert.match(text, /left as-is/, 'band-2 advisory names the no-truncation path: ' + text)
-  assert.match(text, /below the ~200t truncation floor/, 'the advisory names the floor: ' + text)
-  // 落账且原样（含 filler 尾行，未截断）。
-  assert.equal(summaryEvents(session).length, before + 1, 'the band-2 item landed')
+  assert.match(text, /Compressed 1 block/, 'the 300t floor keeps the distill viable: ' + text)
+  assert.match(text, /floor 300t/, 'the advisory names the 300t absolute floor: ' + text)
+  assert.match(text, /truncated to/, 'the advisory names the truncation: ' + text)
+  // 落账且为截断形态（filler 尾行被砍——放行语义已废止）。
+  assert.equal(summaryEvents(session).length, before + 1, 'the item landed truncated')
   const last = summaryEvents(session)[summaryEvents(session).length - 1]!
   const storedText = (readCompactionSummary(last as never).summary ?? []).map((b: { text?: string }) => b.text ?? '').join('')
-  assert.ok(storedText.includes('Band2 line 59'), 'the note is stored untruncated')
+  assert.ok(!storedText.includes('Band2 line 59'), 'the tail narrative is cut (no pass-through)')
+  assert.ok(storedText.includes('## Task') && storedText.includes('## Now'), 'the skeleton headings survive')
 })
 
-test('DB-8: a ceiling below 120t REJECTS with the band-3 guidance', async () => {
+test('DB-8: a thin source also lands on the 300t floor (the band-3 reject is retired)', async () => {
   const env = makeEnv()
-  const session = Session.create('db8-band3')
+  const session = Session.create('db8-floor')
   appendTurn(session, 1)
   await tierOneBlocks(session, env, 1)
   const checkpoint = checkpointSeqOf(session, 0)
-  const filler = Array.from({ length: 200 }, (_, i) => `Filler line ${i}: the narrative this test wants rejected, alpha beta gamma delta epsilon zeta eta theta ${i}.`).join('\n')
+  const filler = Array.from({ length: 200 }, (_, i) => `Filler line ${i}: the narrative this test wants truncated, alpha beta gamma delta epsilon zeta eta theta ${i}.`).join('\n')
   const before = summaryEvents(session).length
   const text = await compressCall(session, env, 'db8', {
     content: [{ startSeq: String(checkpoint), endSeq: String(checkpoint), summary: NOTE + filler + '\n' }],
   })
-  assert.match(text, /REJECTED/, 'band-3 rejects: ' + text)
-  assert.match(text, /below the ~120t minimum/, 'the guidance names the 120t minimum: ' + text)
-  assert.match(text, /distill at a phase close/, 'the guidance names the phase-close move: ' + text)
-  assert.equal(summaryEvents(session).length, before, 'nothing landed for the rejected item')
+  assert.match(text, /Compressed 1 block/, 'the 300t floor keeps the distill viable: ' + text)
+  assert.match(text, /floor 300t/, 'the advisory names the 300t absolute floor: ' + text)
+  assert.match(text, /truncated to/, 'the advisory names the truncation: ' + text)
+  assert.equal(summaryEvents(session).length, before + 1, 'the block landed')
 })

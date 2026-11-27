@@ -55,14 +55,16 @@ function sessionEvents(session: Session) {
 function buildSession(id: string): { session: Session; staleSeq: number; newestSeq: number } {
   const session = Session.create(id)
   appendTurn(session, 1)
-  appendUser(session, longText('q0', 0))            // seq 1
-  appendAssistant(session, longText('a0', 1), 1, 1) // seq 2
+  // Each work segment must clear MIN_CONDENSE_SPAN_TOKENS (2572 since 2026-11-27,
+  // 900/0.35) to survive the range-table row filter the assertions read.
+  appendUser(session, longText('q0', 0) + longText('q0x', 10))            // seq 1
+  appendAssistant(session, longText('a0', 1) + longText('a0x', 11), 1, 1) // seq 2
   const staleSeq = appendInstruction(session, '.\u0000AGENTS.md', 'v1')
-  appendUser(session, longText('q1', 2))
-  appendAssistant(session, longText('a1', 3), 1, 3)
+  appendUser(session, longText('q1', 2) + longText('q1x', 12))
+  appendAssistant(session, longText('a1', 3) + longText('a1x', 13), 1, 3)
   const newestSeq = appendInstruction(session, '.\u0000AGENTS.md', 'v2')
-  appendUser(session, longText('q2', 4))
-  appendAssistant(session, longText('a2', 5), 1, 5)
+  appendUser(session, longText('q2', 4) + longText('q2x', 14))
+  appendAssistant(session, longText('a2', 5) + longText('a2x', 15), 1, 5)
   return { session, staleSeq, newestSeq }
 }
 

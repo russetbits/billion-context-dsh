@@ -186,10 +186,11 @@ export interface FoldPlan {
   readonly paybackRequests: number
 }
 
-/** 手写摘要的常驻成本。2026-11-25 随 doctrine 收紧为 Appendix-A 六字段简报，
- *  从真机实测分布（s2115 n=56 / s5e5c n=33，p50 ~480t）重定为 400，
- *  与 src/condense-note.ts 的 TYPICAL_HANDOFF_NOTE_TOKENS 保持同一依据。 */
-export const TYPICAL_NOTE_TOKENS = 400
+/** 手写摘要的常驻成本。2026-11-27 随信息优先口径放宽为 900（恢复对折叠收益的
+ *  保守估计——note 是折掉的量里「省不回来」的部分，预算给大只会让 fold-plan
+ *  更保守，不会压制 note 本身），与 src/condense-note.ts 的
+ *  TYPICAL_HANDOFF_NOTE_TOKENS 保持同一依据。 */
+export const TYPICAL_NOTE_TOKENS = 900
 
 /**
  * A-9 / M-1（2026-11-23~24）：批量折叠计划。

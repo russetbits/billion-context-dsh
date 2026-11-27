@@ -414,20 +414,24 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   // validateContentItems for why the schema gate alone cannot do this).
   validateContentItems(args.content!)
 
-  // 蒸馏产物截断预算（2026-11-27）：显式 content 蒸馏路径此前没有任何大小约束，
-  // T2/T3 summary 膨胀的结构性根源——蒸馏输出把被替换的块摘要原样抄一遍甚至加长，
+  // 蒸馏产物截断预算（2026-11-27 初版；同日按信息优先口径放宽——逐轮打折实测把
+  // T3 链缩到只剩骨架索引，丢的是恢复会话最贵的 Pointers/Verification 信息，而
+  // 驻留成本只是几百 token）：显式 content 蒸馏路径此前没有任何大小约束，T2/T3
+  // summary 膨胀的结构性根源——蒸馏输出把被替换的块摘要原样抄一遍甚至加长，
   // 每个 checkpoint 节点都常驻后续请求。基准 = 该项 span 吸收的 active 块的
   // summary tokens（frame prefix 计价，与 weight gate 同一口径）；上限 = 基准
-  // × 0.6（被吸收块全是 tier1）或 × 0.4（任一被吸收块 tier>=2——T3 是对 T2
-  // 产物的再蒸馏，份额必须更小）。超限截断（保头砍尾）+ advisory；截断后剩余
-  // 过薄（<200t）说明产物已不成立 → 拒绝该项并给引导。基准不可得（span 不吸收
-  // 任何 active 块的 checkpoint，或基准为 0）→ fail-open，不截断。
+  // × 0.75（被吸收块全是 tier1）或 × 0.6（任一被吸收块 tier>=2——T3 是对 T2
+  // 产物的再蒸馏，份额必须更小），且不低于 ABSOLUTE_MIN_DISTILL_CEILING=300t
+  // ——比率预算只约束「不得比源更肥」，绝对下限保证产物仍是一份可读简报。
+  // 超限截断（保头砍尾）+ advisory；截断后剩余过薄（<200t）说明产物已不成立 →
+  // 拒绝该项并给引导。基准不可得（span 不吸收任何 active 块的 checkpoint，或
+  // 基准为 0）→ fail-open，不截断。
   // 只作用于模型显式 content 项：condense 合成的批已过自己的 weight gate
   // （distill 以 max(tokens, MIN_CONDENSE_SPAN_TOKENS) 为基准），不重复约束。
   const distillBudgetNotes: string[] = []
   if (!condenseSynthesizedRange) {
     const frameTokens = defaultCountTokens(SUMMARY_FRAME_PREFIX)
-    // Smallest ceiling a distill may land under (lead ruling 2026-11-27, three-band
+    // Smallest ceiling a distill may land under (2026-11-27, three-band
     // floor): the kernel's own summary minimum is 50 chars ≈ 13t; below ~120t even
     // the SOURCE summaries are too thin to distill into a readable briefing, so the
     // item is REJECTED with guidance instead of being truncated to a sliver.
@@ -473,8 +477,11 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
         continue
       }
       const anyTierAbove1 = absorbed.some((entry) => entry.tier >= 2)
-      const ratio = anyTierAbove1 ? 0.4 : 0.6
-      const ceiling = Math.floor(base * ratio)
+      const ratio = anyTierAbove1 ? 0.6 : 0.75
+      // 比率上限之上加绝对下限：比率是「不得比源肥」的约束，但一个小源
+      // （如单块 T1 ~200t × 0.75 = 150t）算出的 ceiling 会把产物压到索引级。
+      // 300t 保证任何截断后的产物仍是一份带骨架的可读简报。
+      const ceiling = Math.max(300, Math.floor(base * ratio))
       const summaryTokens = defaultCountTokens(withSummaryFramePrefix(item.summary))
       if (summaryTokens <= ceiling) {
         kept.push(item)
@@ -484,26 +491,13 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       // 而预算按 STORED 形态计（weight gate 同款口径）。
       const cut = truncateNoteToCeiling(item.summary, Math.max(0, ceiling - frameTokens))
       const cutTokens = defaultCountTokens(withSummaryFramePrefix(cut.note))
-      // The usable-token floor is capped BY THE BUDGET, in THREE bands (lead
-      // ruling 2026-11-27):
-      //   ceiling >= 200t  — normal truncation path (head-kept cut).
-      //   120t..200t       — the SOURCE is small (the ceiling tracks the source
-      //                      summaries), so the distill output is roughly the
-      //                      source's own size: no bloat to guard against. The
-      //                      note is accepted UNTRUNCATED with an advisory —
-      //                      truncating to ~120t of an 800-char-class summary
-      //                      gains nothing and broke checkpoint-span's suggested
-      //                      block-id call (kernel floor: "Summary too short,
-      //                      min 50" at 36 chars).
-      //   ceiling < 120t   — REJECT: even the source is too thin to distill
-      //                      into a briefing. (MIN_DISTILL_SOURCE ≈ kernel's
-      //                      50-char minimum ~13t, plus readable headroom.)
-      // An UNDERSIZED truncation inside the ≥200t band is still a REJECT: the
-      // model wrote a note far larger than the span can carry — rewrite, do not
-      // silently ship a sliver.
-      if (cutTokens < Math.min(200, ceiling)) {
-        if (ceiling >= MIN_DISTILL_SOURCE) {
-          // 120t..200t band: the source itself is small — accept the note as-is.
+      // The 300t ABSOLUTE ceiling floor absorbs the old three-band split: a ceiling
+      // under 300t is raised to 300t, so a cut that still lands below 200 usable
+      // tokens means the ceiling genuinely cannot carry a briefing through the
+      // cut — REJECT with guidance. (The MIN_DISTILL_SOURCE gate stays as the
+      // sanity bound on the REJECT copy itself.)
+      if (cutTokens < 200) {
+        {
           distillBudgetNotes.push(
             `  distill note for seqs ${item.startSeq}..${item.endSeq} left as-is: budget ~${ceiling}t `
             + `(source summaries Σ ~${base}t × ${ratio}) is below the ~200t truncation floor, and the source is small — `
@@ -523,7 +517,7 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       }
       distillBudgetNotes.push(
         `  distill note for seqs ${item.startSeq}..${item.endSeq} was ~${summaryTokens}t — truncated to ~${cutTokens}t `
-        + `(budget = source Σ ~${base}t × ${ratio}, the tail was cut). Distill = REFINE the source notes, not copy them: `
+        + `(budget = source Σ ~${base}t × ${ratio}, floor 300t, the tail was cut). Distill = REFINE the source notes, not copy them: `
         + 'rewrite still-relevant content shorter, fold completed entries into one-line outcomes.',
       )
       kept.push({ ...item, summary: cut.note })

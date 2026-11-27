@@ -383,8 +383,12 @@ test('E-12 (M-1): the election names its REAL geometry — and the result report
   // batch's payback dominates and the prefix is folded WITH the later run instead
   // of being left behind. The surviving contract is the calibration the model
   // needs: the result line reports the seqs it ACTUALLY folded.
+  // head=2 (2026-11-27): the note-weight cap re-derived MIN_CONDENSE_SPAN_TOKENS to
+  // 2572 (900/0.35), and a head=1 prefix run (~2065t) no longer qualifies — the
+  // batch would drop it and the M-1 thesis could not be exercised. head=2 keeps the
+  // prefix run (~4130t) above the floor.
   const env = makeEnv()
-  const { session } = walledFixture('election-later', 1, 4)
+  const { session } = walledFixture('election-later', 2, 4)
   const pricing = { floorTokens: 0 }
   const starts = runStarts(session, env, 5, pricing)
   assert.equal(starts.length, 2, 'two eligible runs: ' + JSON.stringify(starts))

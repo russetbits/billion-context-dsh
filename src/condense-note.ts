@@ -265,32 +265,31 @@ export function condenseNoteGaps(note: string): string[] {
 export const MAX_NOTE_WEIGHT_RATIO = 0.35
 
 /**
- * What a handoff note should weigh on this host. F13 (cross-review 2026-11-25):
- * 400 is the value the NEW Appendix-A doctrine is EXPECTED to produce once the
- * prompt distribution settles — it sits inside the paper's 150-400t guidance
- * (median 185t). The old 2026-11-15 measurement (~915t) and the 2026-11-25
- * session samples (s2115 n=56, s5e5c n=33, p50 ~480t / p75 ~690t) were taken
- * under the OLD prompt doctrine; they describe a distribution the new prompts
- * are meant to retire, NOT a target. Re-measure on a distribution written under
- * the new doctrine before touching this number again.
+ * What a handoff note should weigh on this host. 2026-11-27 revision: information
+ * beats brevity — the host's own compaction-basic prompt (dsh-compaction-basic
+ * `COMPACTION_INSTRUCTION`, 8 sections, "preserve exact file paths, commands, error
+ * strings, identifiers") ships with NO token budget at all, and the 400t regime
+ * measurably starved notes of the Pointers/Verification content a resumed session
+ * re-derives most expensively (measured live on this repo's own maintenance
+ * session, 2026-11-27). 900 is the old-distribution p75 (~690t) with headroom —
+ * the number keeps the MIN_CONDENSE_SPAN derivation and the budget DISPLAYS honest
+ * without ever being a cap the model must chase.
  */
-export const TYPICAL_HANDOFF_NOTE_TOKENS = 400
+export const TYPICAL_HANDOFF_NOTE_TOKENS = 900
 
 /**
- * Hard ceiling on a stored handoff note, independent of the weight ratio.
+ * Absolute ceiling on a stored handoff note, independent of the weight ratio.
  *
- * The ratio alone does not bound a note: at `MAX_NOTE_WEIGHT_RATIO` a 84K stretch
- * admits 29K tokens, so it never fires on the folds that matter. Measured on a
- * real 13-block session (2026-11-24) the notes averaged ~1.78K and peaked at 5.2K
- * against a 900-token assumption — the stored area was underestimated by ~4K per
- * block, and 23.1K of a 161K surface was handoff prose. The paper's control
- * harness reports a 185-token median with p97.5 <= 2K, so a note past this
- * ceiling is a narrative, not the "brief for the work ahead" the prompt asks for.
- *
- * Set above the 400-token typical so a good note is never clipped, and low enough
- * to catch the 3-5K outliers that made the stored area grow.
+ * The ratio alone does not bound a note: at `MAX_NOTE_WEIGHT_RATIO` an 84K stretch
+ * admits 29K tokens, so it never fires on the folds that matter. This ceiling is the
+ * one place a note is CLIPPED, and the 2026-11-27 revision sets its trade: the
+ * information loss of clipping a note (re-derived work, lost exact values) costs far
+ * more than the resident tokens the tail would have occupied. 4000 keeps every note
+ * written under the information-first doctrine intact and only catches true runaway
+ * narratives (the 2026-11-24 5.2K outlier). The skeleton headings sit at the TOP of
+ * a note written to the skeleton, so a tail cut still drops narrative first.
  */
-export const MAX_HANDOFF_NOTE_TOKENS = 1500
+export const MAX_HANDOFF_NOTE_TOKENS = 4000
 
 /**
  * M-1 (2026-11-25, verdict §6): the largest TOTAL a single condense call submits.
@@ -388,20 +387,32 @@ export function mechanicalSpanLine(start: number, end: number, messages: number,
 }
 
 /**
- * Cut a note down to a token ceiling, keeping whole LINES from the top.
+ * Cut a note down to a token ceiling, keeping whole LINES from the top — with one
+ * exception: a HEADING line (## Task …, up to #### and **bold** forms) is never
+ * dropped, and its body is only dropped whole-line.
  *
- * A note written to the skeleton puts its load-bearing headings first (Task,
- * Now, then Pointers), so dropping the tail drops narrative — which is exactly
- * what arXiv 2611.05306 Appendix A says to leave out. Truncating costs nothing;
- * refusing costs the model a full rewrite, and output tokens are priced well
- * above cached input.
+ * The old head-kept cut could amputate a whole tail SECTION (Pointers,
+ * Verification, Dead ends) while the model under the information-first doctrine
+ * puts exactly those sections late in the note. Keeping every heading means the
+ * truncated note still SHOWS which fields existed; a resumed reader can ask for
+ * the missing body through decompress instead of never learning the field was
+ * there. A heading line costs ~3-5 tokens — bounded by the heading count, not by
+ * the note size. Truncating costs nothing; refusing costs the model a full
+ * rewrite, and output tokens are priced well above cached input.
  */
 export function truncateNoteToCeiling(note: string, maxTokens: number): { note: string; droppedTokens: number } {
+  // A heading line is never dropped by the budget walk (see the doc comment): the
+  // heading marker survives the cut so the truncated note still SHOWS every field
+  // the model wrote. Body LINES after it are dropped whole-line as before. The
+  // regex is anchored per-line (^#\s style headings and the **Bold** label form)
+  // and carries no `g` flag, so it is stateless between calls — no lastIndex trap.
+  const isHeadingLine = (line: string): boolean => /^#{1,4}\s/.test(line) || /^\*\*[^*]+\*\*\s*$/.test(line)
   const kept: string[] = []
   let used = 0
   for (const line of note.split('\n')) {
+    const isHeading = isHeadingLine(line)
     const lineTokens = defaultCountTokens(line) + 1 // + newline
-    if (used + lineTokens > maxTokens) {
+    if (used + lineTokens > maxTokens && !(isHeading && used < maxTokens)) {
       // A single-LINE note (no \n at all — e.g. a big TIER_SUMMARY) used to be dropped
       // WHOLE here: kept stayed empty, the truncated note was '', and the caller's
       // usable-token floor then rejected the distill outright — costing the model a

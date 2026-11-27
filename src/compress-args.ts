@@ -341,7 +341,7 @@ export const compressParameters = {
           + '## Verification\n- <what you ran, what passed, what failed + the workaround>\n'
           + '## Dead ends\n- <tried X, failed because Y \u2014 so nobody retries it>\n'
           + 'This is a BRIEF FOR THE WORK AHEAD, not a narrative of what happened: pick the facts a resumed session would otherwise re-derive and drop the running commentary.\n'
-          + 'Budget: 150-400 tokens is the sweet spot; anything over 1500 is truncated to its head. Nothing here is a gate \u2014 a missing heading is named in the result and the fold LANDS anyway, so a note never needs rewriting. ## Task and ## Now are the two that matter most; Pointers and Dead ends cost a resumed session the most to re-derive, so write them even when short.',
+          + 'Information beats brevity: preserve exact file paths, commands, error strings, identifiers, numeric values and decisions WITH their rationale \u2014 the host\'s own auto-compaction ships with no size budget at all. ## Task and ## Now are required in practice; Pointers, Verification and Dead ends are the fields a resumed session re-derives most expensively \u2014 write them even when short. A note far over the typical size is truncated to its head (skeleton headings survive); a missing heading is only named in the result \u2014 the fold LANDS anyway, so a note never needs rewriting.',
       },
       topic: { type: 'string' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.topic'] },
       force: { type: 'boolean' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.force'] },

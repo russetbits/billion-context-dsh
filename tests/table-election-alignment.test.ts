@@ -125,7 +125,12 @@ test('A-1: an election whose stretch is pure old-carrier distillation is refused
   // host guards keep checkpoints out of the kernel geometry), so the cheapest
   // stretch is the OLD-CARRIER DISTILLATION. The alignment guard must refuse it
   // and name the explicit forms.
-  const { session, env } = await blocksPlusTail('align-refuse', 30, 1, 1)
+  // blocks=60 (2026-11-27): the note-weight cap re-derived MIN_CONDENSE_SPAN_TOKENS
+  // to 2572 (900/0.35), and a 30-carrier cross shape (~2044t of stored summaries)
+  // no longer clears the capacity gate — the election refused at the kernel-minimum
+  // branch instead of the table-alignment branch this test pins. 60 carriers
+  // (~4088t) restore the intended shape.
+  const { session, env } = await blocksPlusTail('align-refuse', 60, 1, 1)
   const table = rangeTable(session, wholeSurfaceRangeView(session) as never, undefined)
   assert.doesNotMatch(table, /seq \d+\.\.\d+ · \d+msg/, 'the fixture really has no plain table row: ' + table.slice(0, 200))
   const pick = pickCondenseSpan(session, turnOf(env, session), 5)
