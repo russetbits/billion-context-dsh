@@ -224,6 +224,40 @@ export interface LoaderLike {
   entries(): Iterable<LoaderEntryLike>
 }
 
+/**
+ * The isolate-realm fallback of `compaction-basic` is invisible to
+ * `loader.entries()` — 实测（2026-11-27，`@deepseek-ai/cordis-plugin-loader` 1.2.0 +
+ * `dsh-web-app/presets/cordis.patch.yml`）：cordis preset 把 compaction 组挂在 agent
+ * preset mount 出来的独立 `EntryTree`（`dsh-agent-preset-registry` 的 `PresetTree`）里，
+ * 主 loader 树的 `entries()` 永远枚举不到那棵树。但 cordis 的服务注册表是全局唯一的
+ * （`ctx.reflect.store`，`cordis/lib/index.js` `provide()`）：每个 isolate realm 用一个
+ * realm 私有 Symbol 作键（`compaction#compaction` 之类），impl 就存在同一个 store 里，
+ * 且 `impl.ctx.fiber.entry` 直接给出对应的 loader Entry。所以 realm 内的 basic 走
+ * store 扫描禁用，不走 loader。
+ *
+ * 判别（全部实测自 `cordis-plugin-loader/lib/index.js` `Realm.access` 与
+ * `cordis/lib/index.js` `provide()`）：
+ * - 服务名 `impl.name === 'compaction'`（`dsh-compaction` 的 `Service(ctx, "compaction")`）；
+ * - 提供它的 entry 是 basic：`impl.ctx.fiber.entry?.options?.id === 'compaction-basic'`；
+ * - 键不是根平面的 compaction symbol（根平面由 `loader.entries()` 路径负责，那里才
+ *   有持久化的 patch 行；realm 的 basic 是 preset 组合的 fallback，禁掉即可）。
+ */
+const ISOLATE_SYMBOL = Symbol.for('cordis.isolate')
+
+interface ReflectStoreEntry {
+  name: string
+  isolate?: symbol
+  ctx: { fiber?: { entry?: LoaderEntryLike } }
+}
+
+export interface ReflectStoreLike {
+  [key: symbol]: ReflectStoreEntry | undefined
+}
+
+export interface ReflectLike {
+  store: ReflectStoreLike
+}
+
 export interface AcpConfig {
   /**
    * The context window used for pressure decisions, in tokens. When omitted,
@@ -302,6 +336,20 @@ export interface AcpConfig {
    */
   readonly maxOverflowRetries?: number
   /**
+   * No-action degrade fold (方案 D layer 2): how many consecutive user turns a
+   * session may sit at or above the emergency nudge threshold
+   * (nudgeEmergencyThresholdPct, engine default 0.85) without a single
+   * successful `compress` call before the engine folds the largest eligible
+   * span itself in `agent/pre-step`. The counter increments once per
+   * emergency nudge that actually reached the model and resets on a successful
+   * compress. The degrade fires AT MOST ONCE per session (a loop guard), is
+   * stamped with EMERGENCY PROVENANCE like the overflow path, and never
+   * touches the overflow retry budget. Default 3; `0` disables the degrade
+   * (the hard nudge copy remains). Mirrors what the host's compaction-basic
+   * used to buy for free at its 80% line: a no-thought pressure reset.
+   */
+  readonly emergencyFoldAfterTurns?: number
+  /**
    * Take over the host's own automatic compaction. A host composition that
    * ALSO loads `compaction-basic` keeps running that engine's own
    * `agent/pre-step` auto-compaction (its `auto` flag defaults to true), which
@@ -364,6 +412,10 @@ const DEFAULT_CONFIG: AcpConfig = {
   // same-name keys.
   nudgeMaxContextLimitPct: 0.7,
   nudgeEmergencyThresholdPct: 0.85,
+  // No-action degrade fold: after 3 consecutive emergency-nudged turns without
+  // a successful compress the engine folds the largest eligible span itself
+  // (once per session, EMERGENCY PROVENANCE stamped, no overflow retry spent).
+  emergencyFoldAfterTurns: 3,
 }
 
 export function resolveAcpConfig(config: Partial<AcpConfig> = {}): AcpConfig {
@@ -377,7 +429,21 @@ export function resolveAcpConfig(config: Partial<AcpConfig> = {}): AcpConfig {
   // in a Partial config survives the `{ ...DEFAULT_CONFIG, ...config }` spread
   // as `undefined`, and the request-error listener must never read that as
   // "budget 0" (recovery silently disabled while the config says default).
-  return { ...resolved, maxOverflowRetries }
+  return { ...resolved, maxOverflowRetries, emergencyFoldAfterTurns: normalizeEmergencyFoldAfterTurns(resolved.emergencyFoldAfterTurns) }
+}
+
+/**
+ * Normalize the no-action degrade knob the same way `maxOverflowRetries` is
+ * normalized: an explicit `undefined` in a Partial config survives the
+ * DEFAULT_CONFIG spread and must read as "disabled" only when the operator
+ * actually wrote 0 — never when the key was simply absent.
+ */
+function normalizeEmergencyFoldAfterTurns(value: number | undefined): number {
+  if (value === undefined) return 3
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`emergencyFoldAfterTurns must be a non-negative integer (got ${value})`)
+  }
+  return value
 }
 
 /**
@@ -529,6 +595,13 @@ export class AcpCompactionEngine extends CompactionEngine {
 
   /** Set once the host's own auto-compaction entry has been handled (or proven absent), so the lookup runs at most once. */
   private basicCompactionHandled = false
+  /**
+   * Set once an ISOLATED-realm `compaction-basic` has been disabled. Kept
+   * separate from `basicCompactionHandled` because the two planes resolve at
+   * different moments: the loader plane may still be waiting out a late-loading
+   * entry while the realm scan has already found and taken down its target.
+   */
+  private realmCompactionHandled = false
 
   private readonly lastNudgeTurn = new LruMap<string, NudgeGate>(DEFAULT_SESSION_CACHE_LIMIT)
   /** Per-session emergency-nudge injection budget for the current user turn (issue #108). */
@@ -551,9 +624,22 @@ export class AcpCompactionEngine extends CompactionEngine {
   private readonly overflowRetries = new Map<Agent, number>()
   /** Per-session overflow agents, so session progress can reset the recovery budget. */
   private readonly overflowSessions = new Map<Session, Agent>()
+  /**
+   * 方案 D layer 3 — per-session no-action counter. +1 whenever an EMERGENCY
+   * nudge (≥ nudgeEmergencyThresholdPct) is actually injected and the session
+   * has not yet degraded; reset to 0 whenever a successful compress lands (the
+   * tool/result listener sees the call id that handleCompress queued for
+   * hiding). The counter lives for the engine's lifetime, so an idle/overnight
+   * resume at high pressure counts from where it left off — the cross-day
+   * "first step after idle is already over the line" scenario degrades after
+   * the configured K turns, not after K fresh turns.
+   */
+  private readonly noActionTurns = new LruMap<string, number>(DEFAULT_SESSION_CACHE_LIMIT)
+  /** Sessions that already took the one-time no-action degrade fold (loop guard). */
+  private readonly degradedSessions = new LruMap<string, true>(DEFAULT_SESSION_CACHE_LIMIT)
 
   /**
-   * Disable the host's own `compaction-basic` entry, at most once.
+   * Disable the host's own `compaction-basic` entry, at most once per plane.
    *
    * A composition may load BOTH engines. `compaction-basic` runs its own
    * `agent/pre-step` auto-compaction (`config.auto` defaults to true) and
@@ -562,12 +648,28 @@ export class AcpCompactionEngine extends CompactionEngine {
    * summary with every user constraint in that span gone. Disabling its loader
    * entry is a RUNTIME action: `Entry.update({ disabled: true })` writes the
    * option and then disposes that entry's fiber
-   * (`cordis-plugin-loader/lib/index.js:493-506`), so no restart is involved.
+   * (`cordis-plugin-loader/lib/index.js`, `Entry.update` → `fiber.dispose()`),
+   * so no restart is involved.
    *
-   * Fail-open in every direction — no loader service, no matching entry, or a
-   * throwing dispose each log ONE warning and leave the plugin running. A
-   * mount failure here would cost the session its only compression path, which
-   * is strictly worse than two engines competing.
+   * TWO planes, both covered (2026-11-27, live-session seq5455 evidence):
+   * 1. the loader ROOT plane — the composition row the profile patch disables
+   *    at rest; found through `loader.entries()` and disabled the same way;
+   * 2. the ISOLATED realm — the cordis preset (dsh-web-app
+   *    `presets/cordis.patch.yml`) mounts its compaction group inside the
+   *    agent preset's own `EntryTree` (`dsh-agent-preset-registry` PresetTree,
+   *    `isolate: { compaction: true }`), which the root loader's `entries()`
+   *    can NEVER see (measured against loader 1.2.0: a preset tree is a
+   *    separate `EntryTree` rooted at the agent's scope fiber, not a subtree
+   *    of the main loader). Those entries are reached through the GLOBAL
+   *    service store instead: every realm-private implementation registers
+   *    under its own realm Symbol in `ctx.reflect.store` (cordis `provide()`
+   *    keys `impl` by `ctx[Context.isolate][name]`), and
+   *    `impl.ctx.fiber.entry` hands back the owning loader Entry.
+   *
+   * Fail-open in every direction — no loader service, no matching entry, no
+   * reachable reflect store, or a throwing dispose each log ONE warning and
+   * leave the plugin running. A mount failure here would cost the session its
+   * only compression path, which is strictly worse than two engines competing.
    */
   private disableBasicOnce(): void {
     if (this.basicCompactionHandled || !this.config.disableBasic) return
@@ -577,46 +679,98 @@ export class AcpCompactionEngine extends CompactionEngine {
     // reason the lookup is wrapped: a host without the loader plugin must keep
     // running, not lose its only compression path to a failed mount.
     let loader: LoaderLike | undefined
+    let loaderMissing = false
     try {
       loader = (this.ctx as unknown as { loader?: LoaderLike }).loader
     } catch {
       // Reading the service threw = the host has NO loader plugin at all, a
       // PERMANENT environment fact. Silent + final: no composition row to
       // disable, and warning every pre-step would spam forever.
-      this.basicCompactionHandled = true
-      return
+      loaderMissing = true
     }
-    try {
-      if (loader !== undefined && typeof loader.entries === 'function') {
-        for (const entry of loader.entries()) {
-          // `Entry.id` is the TREE path (`parent:child`), while `options.id` is
-          // the id the composition row declared — the latter is the stable match.
-          if (entry.options?.id !== 'compaction-basic') continue
-          // Found it: one attempt, never retried. A failing dispose is usually
-          // persistent (entry already disposed, service gone), so retrying would
-          // only spam warnings; this path is best-effort by design.
-          this.basicCompactionHandled = true
-          void Promise.resolve(entry.update({ disabled: true })).catch((error: unknown) => {
-            const message = error instanceof Error ? error.message : String(error)
-            this.ctx.logger.warn(`billion-context-dsh: could not disable compaction-basic: ${message} (will not retry)`)
-          })
-          return
+    if (!loaderMissing) {
+      try {
+        if (loader !== undefined && typeof loader.entries === 'function') {
+          for (const entry of loader.entries()) {
+            // `Entry.id` is the TREE path (`parent:child`), while `options.id` is
+            // the id the composition row declared — the latter is the stable match.
+            if (entry.options?.id !== 'compaction-basic') continue
+            // Found it: one attempt, never retried. A failing dispose is usually
+            // persistent (entry already disposed, service gone), so retrying would
+            // only spam warnings; this path is best-effort by design. The realm
+            // scan below still runs afterwards — the two planes are independent.
+            this.basicCompactionHandled = true
+            void Promise.resolve(entry.update({ disabled: true })).catch((error: unknown) => {
+              const message = error instanceof Error ? error.message : String(error)
+              this.ctx.logger.warn(`billion-context-dsh: could not disable compaction-basic: ${message} (will not retry)`)
+            })
+          }
         }
+      } catch (error) {
+        // `entries()` itself can throw (host internals mid-rebuild); warn once and
+        // fall through to the retry next pre-step — the lookup is synchronous and
+        // costs nothing, and the handled flag is deliberately NOT set here. The
+        // realm scan still runs: it shares no state with the loader.
+        const message = error instanceof Error ? error.message : String(error)
+        this.ctx.logger.warn(`billion-context-dsh: compaction-basic lookup failed: ${message}; will retry at the next pre-step`)
+        return
       }
-    } catch (error) {
-      // `entries()` itself can throw (host internals mid-rebuild); warn once and
-      // fall through to the retry next pre-step — the lookup is synchronous and
-      // costs nothing, and the handled flag is deliberately NOT set here.
-      const message = error instanceof Error ? error.message : String(error)
-      this.ctx.logger.warn(`billion-context-dsh: compaction-basic lookup failed: ${message}; will retry at the next pre-step`)
-      return
     }
     // A host without the loader plugin is a NORMAL environment, not a fault:
     // there is no composition row to disable, so there is nothing to report.
     // But a loader WITH no compaction-basic row is ambiguous — the entry may be
     // late-loading (a dynamic install after the first pre-step), so leave the
     // flag unset and keep the cheap synchronous lookup alive on later pre-steps.
+    // The realm scan is DISABLED (live-verified 2026-11-27): the preset compaction
+    // group mounts compaction-basic in an ISOLATED realm as the ONLY provider of
+    // the realm-local `compaction` service, and command-compact in the SAME realm
+    // waits for that service (isolate:{compaction:true} never falls back to the
+    // root plane where compaction-acp lives). Disposing the realm basic left
+    // `ctx.get('compaction') === undefined` inside every preset realm — all four
+    // presets reported "loading failed: waiting for compaction" and both the
+    // /compact command and the host auto-compact died with it. The root-plane
+    // disable (the loader `entries()` path above) stays: there the patch row
+    // already disables basic at rest, and compaction-acp IS the root provider.
+    if (loaderMissing) this.basicCompactionHandled = true
   }
+
+  /**
+   * Disable every `compaction-basic` implementation that lives in an ISOLATED
+   * cordis realm (the preset-mounted compaction group), at most once.
+   *
+   * RETIRED (2026-11-27): this scan disposed the preset realm's compaction-basic
+   * fiber, but that basic is the ONLY provider of the realm-local `compaction`
+   * service and command-compact lives in the same realm — disposing it broke
+   * all four presets ("waiting for compaction") plus the /compact command and
+   * the host auto-compact. The method body is kept as an inert stub so the
+   * call sites and tests that reference it still compile; it must NOT be
+   * re-armed unless a realm-local compaction provider OTHER than basic exists
+   * (see the alignment note at the root-plane call site).
+   *
+   * cordis keeps every service implementation in ONE global store
+   * (`ctx.reflect.store`, `cordis/lib/index.js` `provide()`); a realm-private
+   * registration is stored under the realm's own Symbol, so all realms are
+   * enumerable from the plugin's context regardless of which `EntryTree` the
+   * owning entry hangs from. The root-plane implementation is skipped — its
+   * key IS the root compaction symbol, and it belongs to the loader `entries()`
+   * path above (including the persisted patch row that already disables it at
+   * rest). The plugin's own `compaction-acp` implementation is skipped by the
+   * entry-id match: it provides `compaction` too, but from an entry whose id
+   * is `compaction-acp`.
+   */
+  private disableRealmBasics(): void {
+    if (this.realmCompactionHandled) return
+    this.realmCompactionHandled = true
+    // The former store-walk implementation is REMOVED, not commented out: its
+    // behavior (disposing the preset realm's compaction-basic fiber) broke all
+    // four presets and the /compact command (live-verified 2026-11-27). The
+    // original walk is preserved in git history at the commit that introduced
+    // it; see the class-doc note above for why it must not come back.
+    this.ctx.logger.debug?.(
+      "billion-context-dsh: isolated compaction-basic scan retired — the realm basic is the preset realm's ONLY compaction provider",
+    )
+  }
+
   constructor(ctx: Context, config: Partial<AcpConfig> = {}) {
     super(ctx)
     // Class-mounted compositions arrive with the six knobs wrapped in volatile
@@ -907,6 +1061,10 @@ export class AcpCompactionEngine extends CompactionEngine {
       const callId = toolCallIdOfResultEvent(event)
       if (typeof callId !== 'string' || !this.compressCallIdsToHide.has(callId)) return
       this.compressCallIdsToHide.delete(callId)
+      // 方案 D layer 3: a call id queued for hiding means handleCompress landed
+      // at least one durable block — the model DID act. Reset the no-action
+      // counter so a working model is never degraded behind its back.
+      this.noActionTurns.delete(session.id)
       // session.append is NOT reentrant: calling it synchronously inside this
       // session/event dispatch (the outer append still holds the reentry lock)
       // throws "session append cannot reenter while another append is being
@@ -1014,6 +1172,48 @@ export class AcpCompactionEngine extends CompactionEngine {
           },
         )
         if (outcome === null) return decision
+        // 方案 D layer 2/3: an EMERGENCY nudge that actually reached the model is
+        // one more reminder without action. Count it; once the count reaches
+        // emergencyFoldAfterTurns and this session has not degraded yet, the
+        // engine folds the largest eligible span itself INSTEAD of injecting
+        // another reminder — the nudge's range table is computed from the
+        // pre-fold surface, so appending it after the fold would hand the model
+        // stale seqs. The fold never touches the overflow retry budget.
+        // Threshold note (lead 方案 D ruling): the line is nudgeEmergencyThresholdPct
+        // (engine default 0.85), NOT compaction-basic's 0.80 — the emergency tier
+        // already owns a per-turn budget, the kernel's emergencyOverride copy and
+        // the test infrastructure, so reusing it needs no new threshold knob; the
+        // 5-point gap to basic's 0.80 is the price of keeping one threshold source
+        // (preset-aware, operator-tunable) instead of a second hard-coded one.
+        const sessionKey = payload.agent.session.id
+        if (outcome.emergency) {
+          const k = this.config.emergencyFoldAfterTurns ?? 3
+          const count = (this.noActionTurns.get(sessionKey) ?? 0) + 1
+          this.noActionTurns.set(sessionKey, count)
+          if (k > 0 && count >= k && !this.degradedSessions.has(sessionKey)) {
+            this.degradedSessions.set(sessionKey, true)
+            this.noActionTurns.set(sessionKey, 0)
+            try {
+              const folded = await this.emergencyNoActionFold(payload.agent, count)
+              if (folded !== null) {
+                ctx.logger.warn(
+                  `billion-context-dsh: EMERGENCY no-action degrade — the model was reminded ${count} turn(s) at or above the emergency threshold without calling compress; folded procedurally (seqs ${folded.start}-${folded.end}, ~${folded.shadowedTokenCount} tokens shadowed, EMERGENCY PROVENANCE stamped, ledger row written). Semantic detail in the folded span is summarized by the marker; originals stay in the session log for recall. Overflow retry budget untouched.`,
+                )
+                // The folded surface is what the next request must see; skip the
+                // (now stale) nudge this step and let the next step's nudge —
+                // built from the folded surface — take over.
+                return decision
+              }
+              ctx.logger.warn(
+                `billion-context-dsh: no-action degrade armed but nothing eligible to fold on session ${sessionKey}; the hard nudge is delivered instead`,
+              )
+            } catch (error) {
+              // Fail-open exactly like the rest of pre-step: the degrade is an
+              // extra safety net, never a reason to reject the step.
+              ctx.logger.warn(`billion-context-dsh: no-action degrade fold failed (fail-open): ${String(error)}`)
+            }
+          }
+        }
         return { kind: 'enter', messages: [...decision.messages, outcome.message] }
       } catch (error) {
         ctx.logger.warn(`billion-context-dsh: nudge build failed (fail-open): ${String(error)}`)
@@ -1574,6 +1774,98 @@ export class AcpCompactionEngine extends CompactionEngine {
     // pre-fold anchor would read a tokenizer inflation the engine itself caused (round-11 Q4).
     if (recovered !== null) setCalibrationAnchor(session, surfaceTokens(session))
     return recovered
+  }
+
+  /**
+   * 方案 D layer 2 — the no-action degrade fold. The session has been riding at
+   * or above the emergency nudge threshold for `emergencyFoldAfterTurns`
+   * consecutive turns with no successful `compress` call; the model has been
+   * reminded (the hard rider made the nudge an action instruction) and did not
+   * act, so the engine executes ONE marker fold itself — the same durable
+   * transaction the overflow path runs (largest guarded eligible span,
+   * engine-written marker summary, runCompactionTransaction ledger, no LLM
+   * call), but NOT through `agent/request-error`: no retry is consumed and the
+   * overflow budget is untouched. Runs at most once per session
+   * (`degradedSessions`) so a still-ignored fold cannot loop into barrier spam.
+   * The marker carries an EMERGENCY PROVENANCE naming the no-action reason and
+   * the reminder count, so a later reader knows the loss of semantic detail was
+   * procedural, not model-written. The calibration anchor is re-pointed at the
+   * folded surface exactly like `compactForOverflow` does.
+   * Returns null when nothing eligible exists (nothing to reclaim).
+   */
+  private async emergencyNoActionFold(agent: Agent, reminderCount: number): Promise<OverflowRecoveryResult | null> {
+    const session = agent.session
+    const surfaceMessages = eventsToCoreMessages(surfaceEventsOf(session))
+    const tokenCount = resolveTokenCount(agent, surfaceMessages)
+    const window = await this.windowFor(agent)
+    const config = kernelConfigFor({ ...this.env, modelContextLimit: window.limit })
+    const messages = allLogMessages(session)
+    const turn = this.kernel.processTurn({ messages, state: this.store.stateFor(session), config, tokenCount })
+    const stateNow = turn.state
+    this.store.set(session, stateNow)
+    const byRaw = stateNow.messageRefs.byRaw
+    let firstSeq: number | undefined
+    let lastSeq: number | undefined
+    for (const seq of session.surface.nodes) {
+      if (byRaw[String(seq)] === undefined) continue
+      firstSeq ??= seq
+      lastSeq = seq
+    }
+    if (firstSeq === undefined || lastSeq === undefined) return null
+    const view: KernelRangeView = {
+      ranges: [{ startRef: byRaw[String(firstSeq)]!, endRef: byRaw[String(lastSeq)]! }],
+      refs: { byRef: stateNow.messageRefs.byRef },
+    }
+    // Same guard set as the overflow path, same `preserveRecent: 5` pinned
+    // explicitly, same stale-instruction folding — the degrade can only shadow
+    // what the model itself could have compressed.
+    const ranges = buildCompressibleSeqRanges(session, view, {
+      preserveRecent: 5,
+      mediaPriceOf: meterMediaPriceResolver(agent, session),
+      foldStaleInstructionRows: true,
+      foldPricing: foldPricingFor(this.env),
+    })
+    if (ranges.length === 0) return null
+    const aboveFloor = ranges.filter((range) => !range.belowFloor)
+    const pool = aboveFloor.length > 0 ? aboveFloor : ranges
+    const best = pool.reduce((largest, range) => (range.tokens > largest.tokens ? range : largest))
+    const startRef = byRaw[String(best.start)]
+    const endRef = byRaw[String(best.end)]
+    if (startRef === undefined || endRef === undefined) return null
+    const provenance = `no-action degrade: the model was reminded ${reminderCount} turn(s) at or above the emergency threshold without calling compress; this fold was written procedurally by the engine`
+    const summary = overflowMarkerSummary(best.count, provenance, { startSeq: best.start, endSeq: best.end })
+    const applied = this.kernel.applyCompression({
+      ranges: [{ startRef, endRef, summary, topic: 'no-action emergency degrade' }],
+      messages,
+      state: stateNow,
+      config,
+    })
+    if (applied.result.blocksCreated === 0) return null
+    const previousIds = new Set(stateNow.blocks.map((block) => block.blockId))
+    const created = applied.state.blocks.find((block) => !previousIds.has(block.blockId))
+    if (created === undefined) return null
+    const shadowed = shadowedSeqsOf(session, best.start, best.end)
+    if (shadowed.length === 0) return null
+    const shadowedTokenCount = shadowedTokensViaMeter(session, shadowed, agent.ctx)
+    const { provider, model } = routeFor(agent)
+    runCompactionTransaction(session, {
+      start: best.start,
+      end: best.end,
+      shadowedSeqs: shadowed,
+      summary: [{ type: 'text', text: summary }],
+      shadowedTokenCount,
+      provider,
+      model,
+      topic: 'no-action emergency degrade',
+      kernelBlockId: created.blockId,
+      directMessageIds: created.directMessageIds,
+      effectiveMessageIds: created.effectiveMessageIds,
+    })
+    this.store.set(session, applied.state)
+    // Same anchor discipline as compactForOverflow: the next billed request
+    // belongs to the FOLDED surface and must not pair with the pre-fold one.
+    setCalibrationAnchor(session, surfaceTokens(session))
+    return { start: best.start, end: best.end, shadowedSeqs: shadowed, shadowedTokenCount }
   }
 
   /** ACP is model-driven: automatic pressure policy never summarizes by itself. */

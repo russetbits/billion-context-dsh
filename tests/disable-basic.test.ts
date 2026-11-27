@@ -6,13 +6,22 @@
  * 77,280 tokens 折成一条 32 字符摘要，区段里的用户约束全丢。ACP 的
  * `compactIfNeeded` 返回 null 挡不住它 —— 那根本不是宿主的 seam 契约。
  *
- * 这里钉的是 `disableBasicOnce()` 的五个行为面：
+ * 这里钉的是 `disableBasicOnce()` 的七个行为面：
  *   1. 找到 `compaction-basic` → 调 `update({ disabled: true })`
  *   2. 幂等：第二次调用不再动 entry
  *   3. entry 缺失 → warn，不抛
  *   4. 宿主没有 loader 服务 → warn，不抛
  *   5. `disableBasic: false` → 完全不碰 entry
  *   6. `update` 自己抛错 → warn，不抛（挂载绝不能因它失败）
+ *   7. 隔离 realm（retired）：realm 扫描已退役，disableBasicOnce 不碰 realm
+ *      的 compaction-basic，根平面提供者也不受影响
+ *
+ * realm 路径（2026-11-27 退役）：实机验证 disposing realm basic 导致四个 preset
+ * 「waiting for compaction」全部加载失败——realm 内 command-compact 等的
+ * compaction 服务只有 basic 一个提供者，`isolate:{compaction:true}` 又挡住根平面
+ * 的 acp。src/index.ts 已改为 inert stub（`disableRealmBasics` 只置
+ * `realmCompactionHandled` + 打一条 debug log，不再扫描/禁用），下面的 realm
+ * 测试全部改为「退役口径」：断言扫描不碰 realm。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -198,6 +207,188 @@ test('disableBasic: update 抛错只 warn，不抛（挂载绝不能因它失败
       warnTexts(logs).some((m) => /could not disable compaction-basic: dispose exploded/.test(m)),
       `expected the dispose-failure warn, got: ${JSON.stringify(warnTexts(logs))}`,
     )
+  } finally {
+    await fiber.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 隔离 realm（isolate）平面 — 退役口径（2026-11-27）。
+//
+// 退役原因：实机验证 disposing realm basic 导致四个 preset「waiting for
+// compaction」全部加载失败（realm 内 compaction 服务只有 basic 一个提供者，
+// isolate:{compaction:true} 又挡住根平面 acp）——见 src/index.ts
+// `disableRealmBasics` 的 alignment 注释。扫描已从 src 移除，stub 只置
+// `realmCompactionHandled` + 打一条 debug log。
+//
+// 测试 fixture 直接把假 impl 塞进全局 reflect.store 的 realm Symbol 键下，
+// 断言的是「退役后扫描不碰 realm」：entry.update 从未被调用、提供者完好、
+// stub 自身的幂等/不炸语义成立。
+// ---------------------------------------------------------------------------
+
+interface StoreImpl {
+  name: string
+  ctx: { fiber?: { entry?: { options?: { id?: string }; update(options: Record<string, unknown>): unknown } } }
+}
+
+const ISOLATE = Symbol.for('cordis.isolate')
+
+function disableBasicOnceOf(engine: AcpCompactionEngine): () => void {
+  return (engine as unknown as { disableBasicOnce(): void }).disableBasicOnce.bind(engine)
+}
+
+/** The retired realm scan is now an inert stub; reach it through the class-private name. */
+function disableRealmBasicsOf(engine: AcpCompactionEngine): () => void {
+  return (engine as unknown as { disableRealmBasics(): void }).disableRealmBasics.bind(engine)
+}
+
+function realmCompactionHandledOf(engine: AcpCompactionEngine): boolean {
+  return (engine as unknown as { realmCompactionHandled: boolean }).realmCompactionHandled
+}
+
+test('disableBasic: 隔离 realm 的 compaction-basic 不再被碰（扫描已退役）', async () => {
+  // 退役口径（2026-11-27）：disposing realm basic 导致四个 preset「waiting for
+  // compaction」全部加载失败（realm 内 compaction 服务只有 basic 一个提供者，
+  // isolate:{compaction:true} 又挡住根平面 acp），扫描从 src/index.ts 移除，
+  // 只留 inert stub——见 src/index.ts `disableRealmBasics` 的 alignment 注释。
+  const root = new Context()
+  let realmUpdateCalls = 0
+  const { fiber, engine } = await mountWithLoader(root, {
+    *entries(): Iterable<FakeEntry> {
+      yield { options: { id: 'compaction-acp' }, update() { throw new Error('不该被碰') } }
+    },
+  })
+  try {
+    const realmKey = Symbol('compaction#agent')
+    ;(root.reflect.store as Record<symbol, StoreImpl | undefined>)[realmKey] = {
+      name: 'compaction',
+      ctx: { fiber: { entry: { options: { id: 'compaction-basic' }, update() { realmUpdateCalls += 1 } } } },
+    }
+    disableBasicOnceOf(engine)()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(realmUpdateCalls, 0, '退役后的 disableBasicOnce 绝不能碰 realm 的 compaction-basic')
+    // The stub itself is the only thing left of the scan: it flags the plane
+    // handled (its sole remaining semantic) without touching the entry.
+    disableRealmBasicsOf(engine)()
+    assert.equal(realmCompactionHandledOf(engine), true, 'stub 应把 realmCompactionHandled 置位（退役标记）')
+    assert.equal(realmUpdateCalls, 0, 'stub 也不得调 entry.update')
+  } finally {
+    await fiber.dispose()
+  }
+})
+
+test('disableBasic: realm stub 幂等——重复调用只打一次 debug log，entry 始终不被碰', async () => {
+  // 退役口径（2026-11-27）：扫描已退役（四个 preset「waiting for compaction」，
+  // 见 src/index.ts `disableRealmBasics` 的 alignment 注释）。stub 保留的
+  // once-guard 语义仍有意义：重复调用不重复打日志。
+  const logs: LogRow[] = []
+  const root = new Context()
+  let realmUpdateCalls = 0
+  const { fiber, engine } = await mountWithLoader(root, {
+    *entries(): Iterable<FakeEntry> { return },
+  })
+  try {
+    root.logger.exporter({ levels: { default: 3 }, export: (row) => { logs.push(row as LogRow) } })
+    const realmKey = Symbol('compaction#agent')
+    ;(root.reflect.store as Record<symbol, StoreImpl | undefined>)[realmKey] = {
+      name: 'compaction',
+      ctx: { fiber: { entry: { options: { id: 'compaction-basic' }, update() { realmUpdateCalls += 1 } } } },
+    }
+    const stub = disableRealmBasicsOf(engine)
+    stub()
+    stub()
+    stub()
+    assert.equal(realmUpdateCalls, 0, 'stub 无论如何不碰 realm entry')
+    assert.equal(realmCompactionHandledOf(engine), true, '首次调用即置位')
+    const retireLogs = logs
+      .filter((row) => (row as { type?: string }).type === 'debug')
+      .map((row) => JSON.stringify(row))
+      .filter((m) => /isolated compaction-basic scan retired/.test(m))
+    assert.equal(retireLogs.length, 1, `退役 debug 日志只打一次，got: ${JSON.stringify(retireLogs)}`)
+  } finally {
+    await fiber.dispose()
+  }
+})
+
+test('disableBasic: 根平面与 realm 的 compaction 提供者都完好（退役后无任何扫描）', async () => {
+  // 退役口径（2026-11-27）：扫描已退役（四个 preset「waiting for compaction」，
+  // 见 src/index.ts `disableRealmBasics` 的 alignment 注释）。方向反转——旧
+  // 断言是「根平面不被 realm 扫描误伤」，现在没有任何扫描，两个平面的
+  // compaction 提供者都必须原样保留。
+  const root = new Context()
+  let rootImplTouched = false
+  let realmDisabled = false
+  const { fiber, engine } = await mountWithLoader(root, {
+    *entries(): Iterable<FakeEntry> { return },
+  })
+  try {
+    const rootKey = (root as unknown as Record<symbol, Record<string, symbol>>)[ISOLATE].compaction
+    assert.notEqual(rootKey, undefined, '前置：根平面 compaction symbol 已存在')
+    ;(root.reflect.store as Record<symbol, StoreImpl | undefined>)[rootKey] = {
+      name: 'compaction',
+      ctx: { fiber: { entry: { options: { id: 'compaction-basic' }, update(options) { rootImplTouched = options.disabled === true } } } },
+    }
+    const realmKey = Symbol('compaction#agent')
+    ;(root.reflect.store as Record<symbol, StoreImpl | undefined>)[realmKey] = {
+      name: 'compaction',
+      ctx: { fiber: { entry: { options: { id: 'compaction-basic' }, update(options) { realmDisabled = options.disabled === true } } } },
+    }
+    disableBasicOnceOf(engine)()
+    disableRealmBasicsOf(engine)()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(rootImplTouched, false, '根平面的 compaction 提供者必须完好（disabled 从未置 true）')
+    assert.equal(realmDisabled, false, 'realm 的 compaction 提供者必须完好——它是 realm 内唯一的提供者')
+  } finally {
+    await fiber.dispose()
+  }
+})
+
+test('disableBasic: 退役路径不触碰 store——store 里塞抛错对象也不炸、不 warn', async () => {
+  // 退役口径（2026-11-27）：扫描已退役（四个 preset「waiting for compaction」，
+  // 见 src/index.ts `disableRealmBasics` 的 alignment 注释）。旧测试断言的
+  // 「store 抛错 → warn 一次，下一回合重试」已无对应代码路径：扫描不存在，
+  // store 即使坏了也不该被读到。
+  const logs: LogRow[] = []
+  const root = new Context()
+  const realmKey = Symbol('compaction#agent')
+  const { fiber, engine } = await mountWithLoader(root, {
+    *entries(): Iterable<FakeEntry> { return },
+  })
+  try {
+    root.logger.exporter({ levels: { default: 3 }, export: (row) => { logs.push(row as LogRow) } })
+    const store = root.reflect.store as Record<symbol, StoreImpl | undefined>
+    Object.defineProperty(store, realmKey, {
+      get() { throw new Error('store mid-rebuild') },
+      configurable: true,
+    })
+    const once = disableBasicOnceOf(engine)
+    const stub = disableRealmBasicsOf(engine)
+    assert.doesNotThrow(once, 'store 抛错不能穿透到 pre-step housekeeping')
+    assert.doesNotThrow(stub, '退役 stub 同样不能穿透')
+    assert.doesNotThrow(once)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(warnTexts(logs), [], '退役路径不读 store，任何 store 异常都不该产生告警')
+  } finally {
+    delete (root.reflect.store as Record<symbol, unknown>)[realmKey]
+    await fiber.dispose()
+  }
+})
+
+test('disableBasic: false 时 realm 扫描同样不跑', async () => {
+  const root = new Context()
+  let realmDisabled = false
+  const { fiber, engine } = await mountWithLoader(root, {
+    *entries(): Iterable<FakeEntry> { return },
+  }, { disableBasic: false })
+  try {
+    const realmKey = Symbol('compaction#agent')
+    ;(root.reflect.store as Record<symbol, StoreImpl | undefined>)[realmKey] = {
+      name: 'compaction',
+      ctx: { fiber: { entry: { options: { id: 'compaction-basic' }, update() { realmDisabled = true } } } },
+    }
+    disableBasicOnceOf(engine)()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(realmDisabled, false, 'disableBasic: false 表示保留宿主原生行为（含 realm）')
   } finally {
     await fiber.dispose()
   }
