@@ -111,7 +111,7 @@ export interface CondensePick {
    * What the fold DOES. `fold` replaces consumed prose (the normal case);
    * `distill` is the cross-barrier fallback: it folds the gaps AND distils every
    * active carrier inside the span into one block, which is a TIER 2 operation —
-   * the originals behind those carriers stop being recoverable at message level.
+   * the originals behind those carriers leave the visible surface but stay recall-readable (recall({ blockId }) still pages the full original messages — the log keeps the bytes).
    */
   readonly kind: 'fold' | 'distill'
   /** Blocks this fold distils into one (0 for a plain fold). */
@@ -516,7 +516,7 @@ export function pickCondenseSpan(
       const foldCostTokens = suffix[to + 1] ?? 0
       const gates = gatesOf(tokens, keptTokens)
       if (failedOf(gates).length > 0) continue
-      // Keep growing: the LARGEST cut that still passes all three gates is the one
+      // Keep growing: the LARGEST cut that still passes the capacity gate is the one
       // that reclaims the most while staying legal.
       if (best !== undefined && tokens <= best.tokens) continue
       best = {
@@ -539,7 +539,7 @@ export function pickCondenseSpan(
   }
 
   /**
-   * CROSS-BARRIER FALLBACK — fold the older side of the surface in ONE transaction,
+   * CROSS-BARRIER FALLBACK — fold the older side of the surface in ONE durable replace,
    * ending on the LAST active carrier's block ref. That single range folds every gap's
    * prose AND distils every carrier inside it into ONE block (kernel `applyCompression`
    * treats a range with a block-ref edge as tier 2/3), which is the only shape that
@@ -654,12 +654,19 @@ export function pickCondenseSpan(
     if (folded <= 0) return undefined
     const noteTokens = condenseNoteBudget(folded)
     const keptTokens = Math.max(0, surfaceTotal - folded - noteTokens)
-    const endIndex = indexOfSeq.get(spans[spans.length - 1]!.end)
-    // Fail-closed (F7, cross-review 2026-11-25): if the last span's end seq has no
+    // Batch merge price (measured 2026-11-27, probe-batch fixture): a multi-span
+    // batch's durable replace rewrites the surface at the EARLIEST span's start
+    // edge, so the one re-prefill is everything after that edge minus what the
+    // fold removes — `suffix[firstStartIdx] - folded`. The single-span identity
+    // (`suffix[endIndex + 1]`) holds because startIdx - tokens = endIndex+1 for a
+    // contiguous span; multi-span batches were under-quoted by the kept rows
+    // (walls, guarded rows) sitting between the spans.
+    const firstStartIndex = indexOfSeq.get(spans[0]!.start)
+    // Fail-closed (F7, cross-review 2026-11-25): if the first span's start seq has no
     // suffix entry the re-prefill price is UNKNOWN, not zero — a 0 would let the
     // candidate pass the payback and cost gates on a number the engine never priced.
-    if (endIndex === undefined) return undefined
-    const foldCostTokens = suffix[endIndex + 1] ?? 0
+    if (firstStartIndex === undefined) return undefined
+    const foldCostTokens = Math.max(0, (suffix[firstStartIndex] ?? 0) - folded)
     return {
       geometry: {
         startSeq: spans[0]!.start,
@@ -854,6 +861,39 @@ export function pickCondenseSpan(
     ?? (chosen.cutSpan !== undefined
       ? [chosen.cutSpan]
       : condenseRangesOf(items.slice(chosen.firstItem, chosen.lastItem + 1)))
+
+  // TABLE-ELECTION ALIGNMENT (2026-11-27, live session seq4356→4361→4365→4376):
+  // the model writes its note BLIND from the nudge range table, so the elected
+  // stretch MUST overlap the rows that table shows. The timeline above adds the
+  // ACTIVE block carriers, which `buildCompressibleSeqRanges` deliberately
+  // excludes (host guards: checkpoints are their own class, rule 3/16), so an
+  // election can pick a stretch made almost entirely of OLD checkpoint
+  // carriers plus a thin new tail — a tier-2 distillation the table never
+  // offered. The note written for the table rows then lands on carrier
+  // distillation (note mismatch) and the rows themselves stay untouched.
+  // Rule 7: distillation is an EXPLICIT model act (bN..bM boundaries or a
+  // {firstSeq}/{lastSeq} template call) — the election must never select it
+  // silently. Refuse and point at the explicit forms.
+  const tableRows = ranges.filter((range) => range.tokens >= MIN_CONDENSE_SPAN_TOKENS)
+  const pickFromIndex = indexOfSeq.get(spans[0]!.start)
+  const pickToIndex = indexOfSeq.get(spans[spans.length - 1]!.end) ?? pickFromIndex
+  const overlapsTable = pickFromIndex !== undefined && pickToIndex !== undefined && tableRows.some((range) => {
+    const from = indexOfSeq.get(range.start)
+    const to = indexOfSeq.get(range.end) ?? from
+    if (from === undefined || to === undefined) return false
+    const lo = Math.min(from, to)
+    const hi = Math.max(from, to)
+    return Math.min(pickFromIndex, pickToIndex) <= hi && Math.max(pickFromIndex, pickToIndex) >= lo
+  })
+  if (!overlapsTable) {
+    const carriers = spans.flatMap((span) => span.carriers)
+    return {
+      reason: 'the elected stretch sits OUTSIDE the current range table: it consists mainly of already-compressed checkpoint carriers'
+        + (carriers.length > 0 ? ' (' + carriers.join(', ') + ')' : '')
+        + ', which the host guards keep out of the table geometry — folding them from a condense would distill tier-2 originals under a note written for the table rows (note mismatch), so the election refuses it. Distillation is an EXPLICIT act: name the blocks yourself, e.g. compress({ content: [{ startSeq: \'b1\', endSeq: \'b3\', summary: \'<your note>\' }] }) (block-id boundaries distill b1..b3 into one block), or fold a row the table shows with an explicit content range compress({ content: [{ startSeq: <rowStart>, endSeq: <rowEnd>, summary: \'<your note>\' }] }). Run acp_status again for the latest table and its Checkpoint seqs row.',
+      candidates: ranges.slice(0, 6),
+    }
+  }
   // M-3 (2026-11-25): with the payback/cost gates gone, the cross-barrier SHAPE can
   // also arrive through the plain batch path (a run whose spans end on a block ref
   // used to be refused at ~2.3 payback, so only the dedicated fallback ever produced
@@ -867,8 +907,18 @@ export function pickCondenseSpan(
   const folded = spans.reduce((total, span) => total + span.tokens, 0)
   const noteTokens = condenseNoteBudget(folded)
   const kept = Math.max(0, surfaceTotal - folded - noteTokens)
-  const endIndex = indexOfSeq.get(spans[spans.length - 1]!.end)
-  const foldCostTokens = endIndex === undefined ? chosen.foldCostTokens : (suffix[endIndex + 1] ?? 0)
+  // Batch merge price (measured 2026-11-27, probe-batch fixture): the durable
+  // replace of a MULTI-span batch rewrites the surface at the EARLIEST span's
+  // start edge (the checkpoint node of the first range lands there), so the
+  // one re-prefill is everything after that edge minus what the fold removes:
+  // `suffix[firstStartIdx] - folded`. For a single contiguous span this reduces
+  // exactly to the old `suffix[endIndex + 1]` (startIdx - tokens = endIndex+1),
+  // which is why single-row pricing was never wrong — only batches were, by the
+  // kept rows (barriers, guarded walls) sitting BETWEEN the spans.
+  const firstStartIndex = indexOfSeq.get(spans[0]!.start)
+  const foldCostTokens = firstStartIndex === undefined
+    ? chosen.foldCostTokens
+    : Math.max(0, (suffix[firstStartIndex] ?? 0) - folded)
   const gates = gatesOf(folded, kept)
   return {
     spans,

@@ -1320,8 +1320,7 @@ export declare const ABSORB_TOOL_GOOGLE: {
     };
 };
 /** Opt-in image_full tool (restore original-resolution images for a previously
- *  downscaled message). Inject/register only when
- *  config.imageCompression.enabled — NOT part of ACP_TOOLS_* arrays. */
+ *  downscaled message). NOT part of the ACP_TOOLS_* arrays. */
 export declare const IMAGE_FULL_TOOL_DESCRIPTION = "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.";
 /** Opt-in retrieve tool (lossless content-cached retrieval). Inject/register
  *  only when config.ccr.enabled — NOT part of ACP_TOOLS_* arrays (same

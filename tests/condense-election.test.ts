@@ -32,6 +32,8 @@ import { blockRegistry, buildCompressibleSeqRanges, surfaceSuffixTokens } from '
 import {
   MIN_CONDENSE_SPAN_TOKENS,
   condenseFloorRefusal,
+  condenseNoCandidateReason,
+  describePrefixSpans,
   formatPayback,
   makeTools,
   paybackLabel,
@@ -480,7 +482,7 @@ test('E-13: a fragmented surface is folded ACROSS its carriers, and the result s
   const text = await compressCall(session, env, 'cross', { condense: { summary: NOTE } })
   assert.match(text, /distilled \d+ blocks into 1/, 'the result names the merge: ' + text)
   assert.match(text, /tier 2/, 'and the tier')
-  assert.match(text, /no longer recoverable at message level/, 'and that the originals are gone')
+  assert.match(text, /stay recall-readable/, 'and that the originals stay recall-readable (log keeps the bytes; live-verified on a tier-3 block)')
   assert.ok(activeBlocks(session).length < before, 'live carriers went DOWN: ' + activeBlocks(session).length + ' < ' + before)
 })
 
@@ -753,4 +755,55 @@ test('M1-4 (M-3): a batch that covers an active carrier is REPORTED as a distill
         'no plain span covers the checkpoint seq ' + seq + ': ' + JSON.stringify(landed.spans))
     }
   }
+})
+
+// ------------------------------------------------- P-a/P-b/P-c copy (2026-11-26)
+// Live session 011470e0 exposed four copy/semantics defects. These tests pin the
+// fixed copy so a later refactor cannot regress them.
+
+test('P-a: the floor-gate refusal disambiguates surface live from request-input live', () => {
+  const pick = {
+    spans: [{ start: 1, end: 4, endBlock: null, carriers: [], tokens: 9000 }],
+    tokens: 9000, noteTokens: 900, keptTokens: 7495, floorTokens: 16384,
+    belowFloor: true, aboveFloorAvailable: false, guardedRowCount: 3, eligibleRangeCount: 3,
+    carrierCount: 0, foldCostTokens: 9000, paybackRequests: 1,
+    gates: { capacity: false },
+  } as never
+  const withNumber = condenseFloorRefusal(pick, 16384, 168955)
+  assert.match(withNumber, /~7495 live \(surface estimate; request input live is ~168955 — the difference is the fixed head: system prompt, tool registry, injected rows\)/,
+    'the request-input live is named next to the surface estimate: ' + withNumber)
+  const withoutNumber = condenseFloorRefusal(pick, 16384)
+  assert.match(withoutNumber, /the request-input live shown by acp_status additionally counts the fixed head \(system prompt, tool registry, injected rows\)/,
+    'without a billed row the copy still names the second measure: ' + withoutNumber)
+  assert.doesNotMatch(withoutNumber, /~168955/, 'no number is invented: ' + withoutNumber)
+})
+
+test('P-b: the no-candidate tail line reads as "remain + guard-protected", not "all refused"', () => {
+  const reason = condenseNoCandidateReason({
+    startIndex: 0,
+    endIndex: 5,
+    nearest: { startSeq: 10, endSeq: 20, tokens: 9000, keptTokens: 2000, foldCostTokens: 9000, failed: ['capacity'] },
+    surfaceTotal: 100000,
+    floorTokens: 16384,
+    payback: null,
+    eligibleRangeCount: 3,
+    guardedRowCount: 3,
+  })
+  assert.match(reason, /3 foldable run\(s\) remain; 3 more row\(s\) are guard-protected \(current instruction copies, the newest skill catalog, the active user turn\) and cannot join any fold/,
+    'the unambiguous two-count wording is in place: ' + reason)
+  assert.doesNotMatch(reason, /eligible run\(s\), \d+ guarded row\(s\) refused/,
+    'the ambiguous "all refused" reading is gone: ' + reason)
+})
+
+test('problem 4 (P-d): the Still-foldable prefix description never prints a reversed seqs pair', () => {
+  const forward = describePrefixSpans([{ start: 300, end: 500 }, { start: 520, end: 560 }])
+  assert.equal(forward, 'seqs 300..560', 'a monotonic batch prints the plain span: ' + forward)
+  const mixed = describePrefixSpans([{ start: 300, end: 320 }, { start: 789, end: 762 }])
+  assert.equal(mixed, '2 span(s) in position order (checkpoint seqs sit high): 300..320, 762..789',
+    'a mixed distill+gap batch lists each span min..max in position order: ' + mixed)
+  assert.match(mixed, /300\.\.320, 762\.\.789/, 'spans print in position order, never as a descending pair')
+  // The whole rendered line contract: start <= end inside the single-seqs form.
+  const single = describePrefixSpans([{ start: 789, end: 762 }])
+  assert.equal(single, '1 span(s) in position order (checkpoint seqs sit high): 762..789',
+    'even a lone mixed-edge span never prints `seqs 789..762`: ' + single)
 })

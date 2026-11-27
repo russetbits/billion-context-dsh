@@ -44,8 +44,9 @@ export interface RangeTablePrompts {
     header: string;
     /** 标题。占位符:{count}(表格行数) */
     title: string;
-    /** 每行。占位符:{start} {end} {count} {tokens} {toolPct} {textPct} {media} {foldCost} {tools}
-     *  —— `{tools}` 渲染成 ` · tools: bash×12, read×5`（空则整段消失，见 nudge.ts） */
+    /** 每行。占位符:{start} {end} {count} {tokens} {toolPct} {textPct} {media} {foldCost} {payback} {tools}
+     *  —— `{payback}` 是回本周期（foldCost/tokens，形如 `1.0` 或 `—`），`{tools}` 渲染成
+     *  ` · tools: bash×12, read×5`（空则整段消失，见 nudge.ts） */
     line: string;
     /**
      * 批量口径汇总行（A-9，2026-11-23）。占位符:{rows} {reclaim} {fold} {breakEven}。

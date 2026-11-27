@@ -79,7 +79,8 @@ KEEP — these are the only things that survive distillation:
 - Critical constraints discovered ("must support Node 22", "AGENTS.md forbids as any").
 - Design decisions with architectural impact ("chose compress-as-anchor over synthetic messages because prefix cache").
 - User quotes and task state only as attributed history: keep the source ref with any user quote; never carry an UNVERIFIED tier-1 "CURRENT TASK" claim forward as a live directive — relabel it "TASK AS OF THIS BLOCK". A ref-backed objective that no later source marks completed or superseded is not unverified: it carries in the \`Open objectives:\` entry (next bullet), not as a directive.
-- Open objectives — if ANY source block's summary names a user-requested objective that no later source block marks completed or superseded, the distilled summary MUST keep a one-line \`Open objectives:\` entry re-carrying each still-open objective verbatim with its original ref. They are the last thing to drop and the first thing to restore.
+- Open objectives — if ANY source block's summary names a user-requested objective that no later source block marks completed or superseded, the distilled summary MUST keep a one-line \`Open objectives:\` entry re-carrying each still-open objective verbatim with its original ref (one line per objective: \`Open objectives: <goal> (<ref>)\`). They are the last thing to drop and the first thing to restore.
+- Distill = REFINE the source notes, not copy them: rewrite still-relevant content shorter, fold completed entries into one-line outcomes; the distill budget is a fraction of what you replace — the tool result names the exact cap.
 - Whether content is OBSOLETE or SUPERSEDED — mark with one line: "[SUPERSEDED by PR #NNN]" or "[OBSOLETE: deleted in vX.Y.Z]". Do NOT keep the obsolete content's details — just the marker and reason.
 - Function/class/type names and module paths that are the SUBJECT of the work — e.g., "fixed filterCompressedRanges in prune.ts", "added SessionStateRegistry in state.ts". Not exact line numbers or full signatures — just enough to LOCATE the code without searching.
 - Exploration findings: if a block was exploratory with no decision, keep the CONCLUSION in one line ("explored X, not viable because Y"). Do not keep the exploration process.
@@ -99,15 +100,17 @@ FORMAT:
 - Start with the outcome, not the process: "v1.13.0 shipped (7 PRs bundled)" not "implemented 7 PRs then reviewed then merged".
 - Cross-block synthesis: if multiple source blocks cover the same topic (same PR, same feature, same bug), MERGE them into a single group of bullets. Do not repeat the same fact from different blocks — keep it once under the most relevant source header.
 
-SIZE TARGET: 50-150 tokens per source block (excluding the header). If you can't fit it in 150 tokens, you're keeping too much process. If a block has nothing worth keeping (pure noise), output just the header followed by "[no actionable content]."`;
+SIZE TARGET: 50-150 tokens per source block (excluding the header). If you can't fit it in 150 tokens, you're keeping too much process. If a block has nothing worth keeping (pure noise), output just the header followed by "[no actionable content]."
+
+ANCHOR LIFETIME: mN anchors in a summary keep working at EVERY tier — recall re-reads the originals message by message, because the log keeps the bytes (live-verified on a tier-3 block: the full original message stream is still paged out on demand). What a distillation loses is VISIBILITY, not recoverability: the originals leave the visible surface, so every future reader must go through recall (a round-trip) instead of seeing them inline. That trade is the reason to distill only consumed stretches — not a reason to hoard text "before it is lost".`;
 
 export const TIER3_CONDENSE_RULES = `TIER 3 COMPRESSION — ULTRA-CONDENSATION
 
-You are compressing distilled summaries (Tier 2) into ultra-condensed facts (Tier 3). The distilled summaries already contain only decisions and outcomes. Your job is to reduce them to bare factual references.
+You are compressing distilled summaries (Tier 2) into ultra-condensed facts (Tier 3). The distilled summaries already contain only decisions and outcomes. Your job is to reduce them to bare factual references. Distill = REFINE the source notes, not copy them: rewrite still-relevant content shorter, fold completed entries into one-line outcomes; the distill budget is a fraction of what you replace — the tool result names the exact cap.
 
 PRIORITY — when a source block has more facts than the size target allows, keep in this order:
 1. Shipped outcomes (versions released, PRs merged) — these are permanent record.
-2. Open work — PRs/issues still pending AND still-open user-requested objectives (re-carry any source block's \`Open objectives:\` entries verbatim); these may need follow-up.
+2. Open work — PRs/issues still pending AND still-open user-requested objectives (re-carry any source block's \`Open objectives:\` entries verbatim, one line each: \`Open objectives: <goal> (<ref>)\`); these may need follow-up.
 3. Key decisions with architectural impact ("chose X over Y because Z").
 4. Critical constraints ("must support Node 22").
 Drop everything else. Tier 3 is a lookup index, not a knowledge base.

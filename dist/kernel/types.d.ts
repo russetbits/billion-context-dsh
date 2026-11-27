@@ -177,18 +177,6 @@ export interface CrushConfig {
 export type ImageFormat = "webp" | "jpeg" | "png";
 /** How upstream bills this image's payload: pixel-tile model (Anthropic / OpenAI high-detail) or raw byte counting (some relays). */
 export type ImageBillingMode = "pixels" | "bytes";
-/** Image pre-compression routing/downsample + image_full restore (#353). Hosts perform the three-level (global → provider → model) sub-field merge exactly like absorb. Default off: disabled ⇒ byte-identical pass-through. */
-export interface ImageCompressionConfig {
-    enabled: boolean;
-    /** Only route images whose token estimate >= this. Default 512. */
-    minTokens?: number;
-    /** Longest side (px) of the downsample recipe. Default 1280. */
-    maxDimension?: number;
-    /** Lossy encode quality (1-100) of the downsample recipe. Default 80. */
-    quality?: number;
-    /** Encode format of the downsample recipe. Default "webp". */
-    format?: ImageFormat;
-}
 /** One arrival-time image downsample, reported by the host after executing the kernel's recipe. Drives image_full validation and session stats. */
 export interface ImageShrinkRecord {
     ref: string;
@@ -224,12 +212,6 @@ export interface CcrConfig {
 export interface CompressionState {
     blocks: CompressionBlock[];
     messageRefs: MessageRefMap;
-    /** First-render token count per message ref (mNNNNN). Written once when a
-     *  message is first rendered, then read forever — stable across density
-     *  recalibration so rendered <acp tokens> tags do not churn and bust the
-     *  provider prefix cache. Keyed by ref (not raw id): refs survive restarts
-     *  and omp live-N raw-id replacement. */
-    tokenSnapshot: Record<string, number>;
     nudge: NudgeState;
     stats: CompressionStats;
     /** Instant tool-result absorption records. Optional: pre-absorb persisted states lack it. */
@@ -369,8 +351,6 @@ export interface Config {
     rules?: RulesConfig;
     /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
     crush?: CrushConfig;
-    /** Image pre-compression routing/downsample + image_full restore (see image-compress.ts). Absent/disabled = feature off. */
-    imageCompression?: ImageCompressionConfig;
     /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
     ccr?: CcrConfig;
     messageFilters?: import("./filter/types.ts").MessageFiltersConfig;

@@ -280,15 +280,17 @@ test('M5: a projection that fits folds with no FIT RISK stamp', async () => {
   void engine
 })
 
-/** An AGENTS.md injection row in the host shape, always the same scope. */
-function appendInstruction(session: Session, digest: string): void {
+/** An AGENTS.md injection row in the host shape. `scope` separates files so a
+ * single row per scope stays the NEWEST copy — a wall even with
+ * foldStaleInstructionRows (stale rows no longer split spans). */
+function appendInstruction(session: Session, digest: string, scope = './\u0000AGENTS.md'): void {
   session.append('user/message', createUserMessage({
     content: [{ type: 'text', text: 'Instructions v' + digest + ': ' + longText('instr' + digest, 77) }],
     source: {
       kind: 'agent-instructions',
       form: 'instructions',
       baseline: true,
-      changes: [{ action: 'set', scope: './\u0000AGENTS.md', path: 'AGENTS.md', digest }],
+      changes: [{ action: 'set', scope, path: 'AGENTS.md', digest }],
     },
   }), { surfaceOp: 'append' })
 }
@@ -313,9 +315,9 @@ test('M5: an insufficient fold keeps folding disjoint spans inside the SAME retr
   const session = Session.create('overflow-multi-span')
   appendTurn(session, 1)
   appendWork(session, 'segA', 6, 0)
-  appendInstruction(session, 'v1')
+  appendInstruction(session, 'v1', './A\u0000AGENTS.md')
   appendWork(session, 'segB', 6, 100)
-  appendInstruction(session, 'v2')
+  appendInstruction(session, 'v2', './B\u0000AGENTS.md')
   appendWork(session, 'tail', 5, 200)
   // A projection the FIRST fold cannot satisfy but the second can: the paired ratio clamps to 2
   // and the absolute overhead is 80K, BELOW the 100K window so the overhead cap does not stop
@@ -349,9 +351,9 @@ test('M5: a fixed head that alone beats the window folds once, not three times',
   const session = Session.create('overflow-head-alone')
   appendTurn(session, 1)
   appendWork(session, 'segA', 6, 0)
-  appendInstruction(session, 'v1')
+  appendInstruction(session, 'v1', './A\u0000AGENTS.md')
   appendWork(session, 'segB', 6, 100)
-  appendInstruction(session, 'v2')
+  appendInstruction(session, 'v2', './B\u0000AGENTS.md')
   appendWork(session, 'tail', 5, 200)
   // overhead = 260_000 − 130_000 = 130_000 ≥ the 100_000 window.
   recordRequestPair(session, 260_000, 130_000)
@@ -375,9 +377,9 @@ test('M5: when the un-foldable remainder alone beats the window, folding stops a
   const session = Session.create('overflow-remainder-unreachable')
   appendTurn(session, 1)
   appendWork(session, 'segA', 6, 0)
-  appendInstruction(session, 'v1')
+  appendInstruction(session, 'v1', './A\u0000AGENTS.md')
   appendWork(session, 'segB', 6, 100)
-  appendInstruction(session, 'v2')
+  appendInstruction(session, 'v2', './B\u0000AGENTS.md')
   // The recent tail is protected (preserveRecent) and alone is ~75K tokens, so even folding BOTH
   // eligible spans leaves the projection far above the 100K window: inflation 1.4 and overhead
   // 20K give a floor of ~125K. Overhead alone (20K) does NOT trip the head cap — the loop must
@@ -403,9 +405,9 @@ test('M5: a below-floor row the next pass will expose still counts as reclaimabl
   const session = Session.create('overflow-pool-blindness')
   appendTurn(session, 1)
   appendWork(session, 'segA', 4, 0)     // ~10K: folds and still leaves the 15K floor
-  appendInstruction(session, 'v1')
+  appendInstruction(session, 'v1', './A\u0000AGENTS.md')
   appendWork(session, 'segB', 10, 100)  // ~25K: BELOW the floor while segA was resident
-  appendInstruction(session, 'v2')
+  appendInstruction(session, 'v2', './B\u0000AGENTS.md')
   appendWork(session, 'tail', 3, 200)
   // inflation clamps to 2, overhead 80K (< the 100K window, so the fixed-head cap does not fire).
   // Pass 0 folds segA and still projects over the window; the pool snapshot read remainingReclaim 0

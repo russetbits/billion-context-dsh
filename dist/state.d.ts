@@ -26,7 +26,7 @@ export declare class AcpStateStore {
      * deterministic — bN ids are recorded in the durable event or synthesised
      * in ledger order, and run ids continue after the rehydrated max — so block
      * identity survives eviction exactly as it survives a restart. Kernel
-     * fields that reset on eviction (tokenSnapshot, nudge cadence, stats
+     * fields that reset on eviction (nudge cadence, stats
      * counters) all self-heal on the session's next turn.
      */
     private readonly states;

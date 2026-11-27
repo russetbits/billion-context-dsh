@@ -283,21 +283,19 @@ test('P-8: 50 carriers + 45 gaps land as ONE range, ONE block, ONE note (shape a
   const carriers = activeCarriers(session)
   assert.equal(carriers.length, CARRIERS, 'the fixture really carries 50 active blocks')
 
-  const elected = pick(env, session)
-  assert.equal(elected.spans.length, 1, 'ONE range for the whole prefix: ' + JSON.stringify(elected.spans.map((span) => [span.start, span.end, span.carriers.length])))
-  assert.equal(elected.carrierCount, CARRIERS, 'every active carrier is distilled by it')
-  assert.equal(elected.spans[0]!.endBlock, carriers[carriers.length - 1]!.kernelBlockId, 'the terminal arm is the LAST carrier')
-
-  // No overlap, no hole: the covered slice must contain every carrier.
-  const nodes = session.surface.nodes
-  const from = nodes.findIndex((seq) => seq === elected.spans[0]!.start)
-  const to = nodes.findIndex((seq) => seq === elected.spans[0]!.end)
-  assert.ok(from >= 0 && to >= from, 'the range edges sit on the surface in order')
-  const covered = nodes.slice(from, to + 1).filter((seq) => carriers.some((entry) => entry.summarySeq === seq))
-  assert.equal(covered.length, CARRIERS, 'the covered slice contains every carrier — no holes')
+  // TABLE-ELECTION ALIGNMENT (2026-11-27, live seq4356→4376): a 50-carrier prefix
+  // is a tier-2 DISTILLATION, and distillation is an EXPLICIT act (AGENTS.md rule
+  // 7) — the condense election must NOT silently pick a shape the nudge table
+  // never offered (the table rows here cover only the tail gap runs, every
+  // carrier is kept out by the host guards). The election refuses it with the
+  // executable-hint copy; the explicit content call lands the same 50→1 shape.
+  const electedMiss = pickCondenseSpan(session, turnOf(env, session), 5)
+  assert.ok('reason' in electedMiss, 'the silent 50-carrier distill is refused: ' + JSON.stringify(electedMiss))
+  assert.match(electedMiss.reason, /OUTSIDE the current range table/)
+  assert.match(electedMiss.reason, /b1.*b3|content: \[\{ startSeq: 'b1'/, 'the refusal names the explicit form')
 
   const summariesBefore = session.snapshotEvents().filter((event) => event.type === 'compaction/summary').length
-  const text = await call(session, env, 'fifty', { condense: { summary: NOTE } })
+  const text = await call(session, env, 'fifty', { content: [{ startSeq: 'b1', endSeq: 'b50', summary: NOTE }] })
   assert.match(text, /Compressed 1 block/, 'one block for the whole prefix: ' + text.split('\n')[0])
   const summariesAfter = session.snapshotEvents().filter((event) => event.type === 'compaction/summary').length
   assert.equal(summariesAfter - summariesBefore, 1, 'the model note is written ONCE, not once per distilled block')

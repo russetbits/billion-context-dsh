@@ -48,6 +48,24 @@ export { DEFAULT_CONTEXT_WINDOW, detectContextWindow, projectedContextWindow, wi
 export { AlreadyCompressedRangeError, rebuildBlockLedger, resolveSurfaceRange, runCompactionTransaction, shadowedSeqsOf, findOpenTurn, assertNoActiveCompaction, blockRegistry, blockRefForSummarySeq, compactionIdsOfKernelBlocks, summarySeqOfKernelBlock, expandShadowedSeqs, hideCompressToolPair, stripOrphanedSurfaceToolMessages, type AcpBlockLedgerEntry, type CompactionTransactionInput, type ResolvedSurfaceRange, } from './region.ts';
 export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText } from './messages.ts';
 export { ACP_SETTINGS_NAMESPACE, AcpPluginConfigSchema, AcpSettingsSchema, describeSettingsChange, filterSettingsEntry, isVolatileRef, liveSettingsFromRefs, makeSettingsCommandSurface, parseSettingValue, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, unwrapVolatile, VOLATILE_WRITE, type AcpSettings, type AcpSettingsDescriptor, type AcpSettingsInput, type AcpSettingsService, type LegacySettingsService, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, } from './settings.ts';
+/**
+ * The slice of the cordis loader this plugin touches. The base
+ * `@deepseek-ai/cordis` types do not declare a `loader` field — the loader
+ * package extends the context at runtime and provides the service itself
+ * (`cordis-plugin-loader/lib/index.js`, `ctx.reflect.provide("loader", …)`).
+ * A module augmentation would make the loader a compile-time dependency of a
+ * plugin whose peer set does not include it, so the service is reached through
+ * one structural assertion in `disableBasicOnce` instead.
+ */
+export interface LoaderEntryLike {
+    options?: {
+        id?: string;
+    };
+    update(options: Record<string, unknown>): Promise<unknown> | unknown;
+}
+export interface LoaderLike {
+    entries(): Iterable<LoaderEntryLike>;
+}
 export interface AcpConfig {
     /**
      * The context window used for pressure decisions, in tokens. When omitted,
@@ -125,6 +143,20 @@ export interface AcpConfig {
      * request that cannot be repaired cannot retry forever.
      */
     readonly maxOverflowRetries?: number;
+    /**
+     * Take over the host's own automatic compaction. A host composition that
+     * ALSO loads `compaction-basic` keeps running that engine's own
+     * `agent/pre-step` auto-compaction (its `auto` flag defaults to true), which
+     * silently replaces the model's `compress` summaries with a host-written one
+     * — measured on a live session: 121 messages / 77,280 tokens folded into a
+     * 32-character summary that dropped every user constraint it covered.
+     * `disableBasic` (default true) disables that loader entry at runtime, so ACP
+     * owns the only compression path and no message is ever summarized by a
+     * writer that does not know the note contract. Set false to keep the host's
+     * native behaviour instead. The mount NEVER fails over this: an unreachable
+     * loader/entry logs one warning and the plugin runs unchanged.
+     */
+    readonly disableBasic: boolean;
     /**
      * Escape hatch: disable the runtime-settings integration entirely
      * (composition-layer ONLY — deliberately not exposed through the settings
@@ -223,6 +255,8 @@ export declare class AcpCompactionEngine extends CompactionEngine {
      * revive lost-config bugs with every unit test green.
      */
     readonly env: ToolEnvironment;
+    /** Set once the host's own auto-compaction entry has been handled (or proven absent), so the lookup runs at most once. */
+    private basicCompactionHandled;
     private readonly lastNudgeTurn;
     /** Per-session emergency-nudge injection budget for the current user turn (issue #108). */
     private readonly emergencyNudges;
@@ -244,6 +278,24 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     private readonly overflowRetries;
     /** Per-session overflow agents, so session progress can reset the recovery budget. */
     private readonly overflowSessions;
+    /**
+     * Disable the host's own `compaction-basic` entry, at most once.
+     *
+     * A composition may load BOTH engines. `compaction-basic` runs its own
+     * `agent/pre-step` auto-compaction (`config.auto` defaults to true) and
+     * writes a summary that never read the ACP note contract — measured on a
+     * live session: 121 messages / 77,280 tokens folded into a 32-character
+     * summary with every user constraint in that span gone. Disabling its loader
+     * entry is a RUNTIME action: `Entry.update({ disabled: true })` writes the
+     * option and then disposes that entry's fiber
+     * (`cordis-plugin-loader/lib/index.js:493-506`), so no restart is involved.
+     *
+     * Fail-open in every direction — no loader service, no matching entry, or a
+     * throwing dispose each log ONE warning and leave the plugin running. A
+     * mount failure here would cost the session its only compression path, which
+     * is strictly worse than two engines competing.
+     */
+    private disableBasicOnce;
     constructor(ctx: Context, config?: Partial<AcpConfig>);
     /**
      * Register (and remember the disposer of) the four ACP tools for the CURRENT

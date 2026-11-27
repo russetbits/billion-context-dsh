@@ -112,7 +112,7 @@ export declare function buildToolCallIndex(events: readonly SessionEvent[]): Rea
  * to BOTH durable writes) and again at projection (below) as an idempotent
  * safety net for legacy blocks written before the feature.
  */
-export declare const SUMMARY_FRAME_PREFIX = "[Model-written summary \u2014 not user words; re-verify any obligations before relying on them]";
+export declare const SUMMARY_FRAME_PREFIX = "[Model-written summary \u2014 not user words; verify obligations before relying on them. Compressed \u2014 originals via recall.]";
 export declare function withSummaryFramePrefix(text: string): string;
 /**
  * The lead-in of a summary the ENGINE writes itself — today only the
@@ -133,8 +133,21 @@ export declare function isEngineWrittenSummary(text: string): boolean;
  * desperation fold MUST be distinguishable from a legitimate one when someone (or
  * a later heuristic) reads this block — otherwise every floor statistic computed
  * from durable folds is reading a lie (cross-review item 1).
+ *
+ * The marker is ALSO the resumed model's only description of what just happened:
+ * this fold happens OUTSIDE any model turn (the provider already rejected the
+ * request), so the next turn sees a block it did not create and the compression
+ * call is not in its history. The note therefore states the action, the covered
+ * seq range (`startSeq`/`endSeq`), and the FIRST thing to do next — recall the
+ * user's standing instructions and the task state before continuing (measured
+ * 2026-11-25: a basic-engine marker was misread as the assistant's own reply,
+ * and a model-written note lost user-supplied credentials; both are the same
+ * failure — the note did not say what happened and what to read back first).
  */
-export declare function overflowMarkerSummary(hiddenCount: number, provenance?: string): string;
+export declare function overflowMarkerSummary(hiddenCount: number, provenance?: string, range?: {
+    readonly startSeq: number;
+    readonly endSeq: number;
+}): string;
 /**
  * Kernel block id per compaction id, read from the durable block ledger.
  *

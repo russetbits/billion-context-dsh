@@ -129,8 +129,26 @@ test('split ①: a protected row in the MIDDLE yields one block per side, in thi
   // two blocks readable as one record split in two.
   const spans = notes.map((note) => /of seqs (\d+)\.\.(\d+)/.exec(note)?.slice(1).join('..'))
   assert.deepEqual(spans, [`${seqs.q0}..${seqs.last}`, `${seqs.q0}..${seqs.last}`], 'both pieces name the SAME requested span')
-  // (c) The note itself is stored in BOTH blocks, unchanged after the coverage line.
-  for (const note of notes) assert.ok(note.includes(SUMMARY), 'the model\'s whole note is carried verbatim')
+  // (c) Batch note dedup (B 方案, 2026-11-26): the FIRST cut block still carries
+  // the model's whole note verbatim after the coverage line; the SECOND block
+  // carries a one-line POINTER to it instead — batch position + seqs range +
+  // the first block's compactionId + an executable recall hint.
+  assert.ok(notes[0]!.includes(SUMMARY), 'the first block carries the whole note verbatim')
+  const firstBlockId = (session
+    .snapshotEvents()
+    .find((event) => event.type === 'compaction/summary')?.data as unknown as { compactionId?: string })?.compactionId
+  const pointer = notes[1]!
+  assert.ok(pointer.startsWith('[split 2/2 of seqs '), 'the pointer block keeps its coverage line')
+  assert.match(pointer, /^Batch block 2\/2 covering seqs \d+\.\.\d+ — full handoff note lives in block [0-9a-f-]+; recall\(\{ blockId: "[0-9a-f-]+" \}\) to read it back\./m,
+    'the second block carries the pointer line instead of the note: ' + JSON.stringify(pointer))
+  assert.doesNotMatch(pointer, new RegExp(SUMMARY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\n/g, '\\n')),
+    'the pointer block does NOT carry the full note')
+  if (firstBlockId) {
+    assert.ok(pointer.includes(firstBlockId), `the pointer names the first block's compactionId (${firstBlockId.slice(0, 8)}): ${pointer}`)
+  }
+  const resultLine = text
+  assert.match(resultLine, /note dedup: full note in block [0-9a-f]+, 1 pointer block\(s\) reference it instead of storing the note \(~\d+ tokens saved resident\)/,
+    'the result reports the dedup saving for reconciliation: ' + resultLine)
 })
 
 // ---------------------------------------------------------------- ②

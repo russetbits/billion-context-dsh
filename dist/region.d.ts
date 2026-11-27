@@ -304,6 +304,28 @@ export declare const DEFAULT_FOLD_FLOOR_PCT = 0.15;
  * protecting a working set (a `?? 0` slip turning every range into belowFloor is
  * the footgun this predicate exists to close).
  */
+/**
+ * Smallest stretch a condense may fold: the smallest span that can carry a handoff note
+ * this host's models actually write inside the note-weight cap — `400 / 0.35`, rounded up
+ * (1143; 2026-11-25: `TYPICAL_HANDOFF_NOTE_TOKENS` re-measured at 400 after the doctrine
+ * moved to the Appendix-A four-field briefing — see src/tools.ts for the distribution).
+ * Moved here so the NUDGE can test the same number without importing the tool
+ * layer (tools.ts imports nudge.ts, so the reverse import would be a cycle). The two
+ * factors must stay equal to `TYPICAL_HANDOFF_NOTE_TOKENS` / `MAX_NOTE_WEIGHT_RATIO` in
+ * src/tools.ts — a test pins that equality so the pair cannot drift.
+ *
+ * F13 (cross-review 2026-11-25, accepted residual window): a span between
+ * 1143 and 4286 tokens can clear this election floor and then still be refused
+ * by the write-time gates — the weight gate (note > 35% of the span) bites up
+ * to `MAX_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO` = 1500/0.35 ≈ 4286t,
+ * above which the absolute note ceiling (1500t) keeps the ratio inside the cap
+ * instead. Accepting this window: the election floor must stay derivable from a
+ * NOTE-SIZE assumption (the weight gate's own arithmetic needs it), and a floor
+ * high enough to close the window entirely would also lock out spans a note CAN
+ * carry. The refusal names the compliant escape (an explicit `content` range),
+ * so the window costs one wasted condense turn, not a dead end.
+ */
+export declare const MIN_CONDENSE_SPAN_TOKENS: number;
 export declare function belowWorkingSetFloor(totalTokens: number, liveAfterTokens: number, floor?: number): boolean;
 /**
  * Price an EXPLICIT span with the same implementation the range table uses
@@ -316,6 +338,8 @@ export declare function foldSpanPricing(session: Session, startSeq: number, endS
     readonly spanTokens: number;
     readonly liveAfterTokens: number;
     readonly belowFloor: boolean;
+    /** Everything AFTER the span's end: what ONE fold re-prefills. */
+    readonly foldCostTokens: number;
 };
 /** Fold pricing inputs, threaded as ONE object so the render chain carries one slot. */
 export interface FoldPricing {
@@ -332,6 +356,15 @@ export interface FoldPricing {
      * A row under it is flagged, and `condense` refuses it unless forced.
      */
     readonly floorTokens?: number;
+    /**
+     * Ceiling on ONE fold's re-prefill, in tokens (see `foldCostTokens`). A fold
+     * costs `suffix[endIndex + 1]` ONCE and then removes those bytes from every later
+     * request. Retained for PRICING/PROVENANCE reporting only — M-3 (2026-11-25)
+     * removed it as a GATE: the condense election is guarded by the working-set
+     * floor alone (Appendix D, arXiv 2611.05306), the only gate with experimental
+     * support. Unset means nothing is configured.
+     */
+    readonly maxFoldCostTokens?: number;
 }
 export declare function surfaceSuffixTokens(session: Session, mediaPriceOf?: MediaPriceOf): number[];
 /**
@@ -439,9 +472,10 @@ export declare function newestSkillCatalogSeqOf(session: Session): number | null
  * instruction with no error to notice — the fallback then is to offer no
  * foldable instruction rows at all (return an empty set), not to keep folding.
  *
- * Only an explicit caller opts in (foldStaleInstructionRows, used by condense).
- * The nudge range table never does: a stale copy stays a WALL there, so a span the
- * model names can never reach across policy rows it might still need.
+ * Only an explicit caller opts in (foldStaleInstructionRows — the condense
+ * election, the nudge range table and the emergency overflow pool all do). A
+ * caller that keeps the default folds nothing: the stale row then stays a WALL
+ * that splits a span, never an offered candidate.
  */
 export declare function staleInstructionRowsOf(session: Session): Set<number>;
 /** Text left in place of a pruned nudge row (same shape as `PRUNE_NOTE`). */

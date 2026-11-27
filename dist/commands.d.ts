@@ -5,6 +5,6 @@
  * @module billion-context-dsh/commands
  */
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands';
-import { type ToolEnvironment } from './tools.ts';
+import { type ToolEnvironment } from './shared.ts';
 /** Register the /acp-prune command (idempotent per engine). */
 export declare function acpCommand(env: ToolEnvironment): CommandDefinition;

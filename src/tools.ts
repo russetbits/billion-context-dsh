@@ -83,7 +83,7 @@ export { mnRefIndex, compressParameters } from './compress-args.ts'
 export type { CondensePick, CondenseSpan, CondenseMiss } from './condense-elect.ts'
 export { MIN_CONDENSE_SPAN_TOKENS } from './region.ts'
 export { pickCondenseSpan } from './condense-elect.ts'
-export { condenseFloorRefusal, condenseNoCandidateReason, formatPayback, paybackLabel } from './condense-note.ts'
+export { condenseFloorRefusal, condenseNoCandidateReason, describePrefixSpans, formatPayback, paybackLabel } from './condense-note.ts'
 export {
   condenseNoteGaps, missingCondenseHeadings, noteWeightRatio, noteWeightRejection,
   truncateNoteToCeiling, MAX_NOTE_WEIGHT_RATIO, TYPICAL_HANDOFF_NOTE_TOKENS,

@@ -1404,6 +1404,14 @@ export class AcpCompactionEngine extends CompactionEngine {
       const ranges = buildCompressibleSeqRanges(session, view, {
         preserveRecent: 5,
         mediaPriceOf: meterMediaPriceResolver(agent, session),
+        // Emergency semantics are "fold what is foldable": a stale instruction row
+        // (superseded AGENTS.md injection / superseded catalog) cannot come back —
+        // folding it while the newest copy stays visible reclaims real bytes and
+        // never re-triggers an injection (rule 16, live-measured). Keeping it a
+        // barrier here would make the emergency pool deny the only reclaim a long
+        // session has left. The CURRENT copy stays a wall: it sits in
+        // `protectedSurfaceSeqs` and outside `staleInstructionRowsOf` on every path.
+        foldStaleInstructionRows: true,
         foldPricing,
       })
       if (ranges.length === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }

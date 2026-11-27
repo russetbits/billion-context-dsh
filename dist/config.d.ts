@@ -90,12 +90,22 @@ export declare const WORKING_SET_FLOOR_MIN_TOKENS = 8192;
  * surface split that can never be folded again, so this arithmetic is biased
  * TOWARD the larger floor and the 16K choice is the conservative reading.
  */
+/**
+ * The number the condense CAPACITY gate uses: a fold whose remainder falls under
+ * `floorTokens` is refused (`condenseFloorRefusal` names the compliant move), and
+ * `force: true` is the operator's bypass. This is the ONLY gate — M-3 (2026-11-25)
+ * removed the other two (affordability, payback): they were never independently
+ * decisive on a live session and are guarded by the batch pricing instead.
+ * Capacity is the only one with experimental support (Appendix D of
+ * arXiv 2611.05306).
+ */
 export declare const WORKING_SET_FLOOR_MAX_TOKENS = 16384;
 /**
- * The ONE number the condense floor gate uses: a fold whose remainder falls under
- * `floorTokens` is refused (`condenseFloorRefusal` names the compliant move), and
- * `force: true` is the operator's bypass. No election-side cost model exists any more:
- * the price of a fold is REPORTED (`foldCostTokens`), never used to refuse one.
+ * Retained PRICING annotations, no longer gates (M-3, 2026-11-25): the condense
+ * election applies the working-set floor alone. Payback (`foldCost / spanTokens`
+ * in requests) and re-prefill cost stay REPORTED — nudge range rows, condense
+ * result lines, provenance — so the model still sees the trade, but no ceiling
+ * refuses a fold for being a bad trade.
  */
 export declare function foldPricingFor(input: KernelConfigInput): FoldPricing;
 export declare function kernelConfigFor(input: KernelConfigInput): Config;

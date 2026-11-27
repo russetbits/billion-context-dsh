@@ -117,7 +117,7 @@ export function condenseNoCandidateReason(input: {
       lines.push(`  · capacity gate: folding it leaves ~${nearest.keptTokens} live, under the working-set floor ~${input.floorTokens} (short by ~${Math.max(0, input.floorTokens - nearest.keptTokens)}). The floor is not bypassable by waiting — only \`force:true\` crosses it`)
     }
   }
-  lines.push(`${input.eligibleRangeCount} eligible run(s), ${input.guardedRowCount} guarded row(s) refused by the guards (current instruction copies, the newest skill catalog, the active user turn). This election has NO fallback: it folds a shape that passes the capacity gate, or it folds nothing.`)
+  lines.push(`${input.eligibleRangeCount} foldable run(s) remain; ${input.guardedRowCount} more row(s) are guard-protected (current instruction copies, the newest skill catalog, the active user turn) and cannot join any fold. This election has NO fallback: it folds a shape that passes the capacity gate, or it folds nothing.`)
   return lines.join('\n')
 }
 
@@ -129,7 +129,7 @@ export function condenseNoCandidateReason(input: {
  * nothing to fold was told to widen into a guard. Both are loops. Exported so
  * every branch is testable without building three fixtures.
  */
-export function condenseFloorRefusal(pick: CondensePick, floor: number): string {
+export function condenseFloorRefusal(pick: CondensePick, floor: number, requestLiveTokens?: number): string {
   const first = pick.spans[0]!
   const last = pick.spans[pick.spans.length - 1]!
   const payback = paybackLabel(pick.foldCostTokens, pick.tokens)
@@ -148,7 +148,15 @@ export function condenseFloorRefusal(pick: CondensePick, floor: number): string 
   const head = `compress: condense refused seqs ${first.start}..${last.end} — the engine elected ${shape} totaling ${pick.tokens}t; folding them costs ${pick.foldCostTokens}t of re-prefill (pays back in ${payback}) and leaves ~${pick.keptTokens} live.\n`
   const lines: string[] = []
   if (!pick.gates.capacity) {
-    lines.push(`  · floor gate: ~${pick.keptTokens} live is under the working-set floor ~${floor} (short by ~${Math.max(0, floor - pick.keptTokens)}), so folding it strands the working set. Fold a SMALLER span instead — a fold leaves exactly as much room as it does NOT remove, so the widest available span is the one that strands it.`)
+    // 2026-11-26 (live session 011470e0): the refusal's `live` and acp_status's
+    // `live` are two DIFFERENT measures — this line prices the surface suffix
+    // (visible nodes), acp_status's `Request input sizes: live` counts the whole
+    // request input including the fixed head. Naming the gap in the same breath
+    // stops the model from reading the two numbers as a contradiction.
+    const headNote = requestLiveTokens === undefined
+      ? ' — the request-input live shown by acp_status additionally counts the fixed head (system prompt, tool registry, injected rows)'
+      : ` (surface estimate; request input live is ~${requestLiveTokens} — the difference is the fixed head: system prompt, tool registry, injected rows)`
+    lines.push(`  · floor gate: ~${pick.keptTokens} live${headNote} is under the working-set floor ~${floor} (short by ~${Math.max(0, floor - pick.keptTokens)}), so folding it strands the working set. Fold a SMALLER span instead — a fold leaves exactly as much room as it does NOT remove, so the widest available span is the one that strands it.`)
     // 2026-11-26 live sessions: the earlier copy mentioned force in passing and the
     // model never used it — the session stalled at high pressure. Make the bypass
     // the EXPLICIT recommendation, with the exact call shape ready to copy.
@@ -161,6 +169,34 @@ export function condenseFloorRefusal(pick: CondensePick, floor: number): string 
   }
   lines.push(`  Batch only spans you would fold anyway: one call pays ONE re-prefill measured from its EARLIEST rewrite point.`)
   return head + lines.join('\n')
+}
+
+/**
+ * Still-foldable prefix description (problem 4, live session 011470e0 seq 791):
+ * a multi-span batch is POSITION-ordered, so `firstSpan.start` can exceed
+ * `lastSpan.end` numerically (a distilled checkpoint node carries a much higher
+ * seq than the gap run after it). Printing `seqs 789..762` reads as a reversed
+ * range. Exported so the rendering branch is unit-testable: a mixed distill+gap
+ * pick MUST never print a descending `seqs X..Y` pair.
+ */
+export function describePrefixSpans(
+  spans: ReadonlyArray<{ readonly start: number; readonly end: number }>,
+): string {
+  const first = spans[0]!
+  const last = spans[spans.length - 1]!
+  // Each span is printed min..max: a MIXED distill+gap span carries its start/end
+  // from different dimensions (the distilled block's checkpoint seq is high while
+  // the gap run's end seq is lower — live session 011470e0 seq 791 printed
+  // "seqs 789..762"), so min..max is the position-ordered, unambiguous form.
+  const ordered = (span: { readonly start: number; readonly end: number }): string => {
+    const lo = Math.min(span.start, span.end)
+    const hi = Math.max(span.start, span.end)
+    return `${lo}..${hi}`
+  }
+  const anyReversed = spans.some((span) => span.start > span.end)
+  return first.start <= last.end && !anyReversed
+    ? `seqs ${first.start}..${last.end}`
+    : `${spans.length} span(s) in position order (checkpoint seqs sit high): ${spans.map(ordered).join(', ')}`
 }
 
 /**
@@ -279,6 +315,79 @@ export const FORCED_BATCH_MIN_ADVANTAGE = 2
 
 
 /**
+ * 段级 note（segment note, 2026-11-27）：批内 note dedup 之后，指针块覆盖的每段
+ * 只留一行指针，该段自己的细节（做了什么/结论/关键值/遗留）没有段级区分。两个
+ * 补法（引擎绝不自己摘要的铁律不变）：
+ *  a. 模型在 `condense.spans` 里逐段写 note（主路径）；
+ *  b. 模型没写时，指针块自动带一行从 surface 元数据生成的机械描述（兜底）。
+ *
+ * 权重关系（写实现时必须保持的约束）：`noteWeightRatio` / `MAX_HANDOFF_NOTE_TOKENS`
+ * 只约束**全局 handoff note** 的写入；段级 note 是指针块上的**新增信息**，不进全局
+ * note 的预算，也不触发权重拒绝——否则段级细节会挤占全局 note 的 35% 份额，模型
+ * 就不敢写段级 note 了。防膨胀改用独立的字符上限（见下）。
+ */
+
+/** 单条模型段级 note 的字符上限：1-3 行小结，超长截尾。 */
+export const MAX_SEGMENT_NOTE_CHARS = 600
+
+/** 段级 note 输入行（condense.spans 的元素）。 */
+export interface SegmentSpanNote {
+  readonly startSeq: number
+  readonly endSeq: number
+  readonly note: string
+}
+
+/**
+ * 归一模型提交的 `condense.spans`：字符串 seq 转 number、trim、空 note 丢弃、
+ * 超长截尾。start > end 的条目按交换后的区间保留（与 content 的 swap 语义一致）。
+ * 引擎不校验 spans 是否命中 elected spans——不命中的条目自然无人引用。
+ */
+export function normalizeSegmentNotes(raw: unknown): SegmentSpanNote[] {
+  if (!Array.isArray(raw)) return []
+  const notes: SegmentSpanNote[] = []
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') continue
+    const item = entry as { startSeq?: unknown; endSeq?: unknown; note?: unknown }
+    const start = typeof item.startSeq === 'number' ? item.startSeq : typeof item.startSeq === 'string' ? Number.parseInt(item.startSeq, 10) : Number.NaN
+    const end = typeof item.endSeq === 'number' ? item.endSeq : typeof item.endSeq === 'string' ? Number.parseInt(item.endSeq, 10) : Number.NaN
+    if (!Number.isFinite(start) || !Number.isFinite(end)) continue
+    if (typeof item.note !== 'string' || item.note.trim().length === 0) continue
+    const note = item.note.trim().length > MAX_SEGMENT_NOTE_CHARS
+      ? item.note.trim().slice(0, MAX_SEGMENT_NOTE_CHARS) + '…'
+      : item.note.trim()
+    notes.push({ startSeq: start, endSeq: end, note })
+  }
+  return notes
+}
+
+/**
+ * 一个 submitted span 对应的段级 note 文本：取与该 span 区间**相交**的模型条目，
+ * 按起始 seq 排序拼接。无命中返回 undefined（调用方落机械描述兜底）。
+ * 相交而非包含：模型的分段与引擎 elected spans 不必逐边对齐。
+ */
+export function segmentNoteForSpan(
+  notes: readonly SegmentSpanNote[],
+  start: number,
+  end: number,
+): string | undefined {
+  const lo = Math.min(start, end)
+  const hi = Math.max(start, end)
+  const hits = notes
+    .filter((item) => Math.min(item.startSeq, item.endSeq) <= hi && Math.max(item.startSeq, item.endSeq) >= lo)
+    .sort((a, b) => Math.min(a.startSeq, a.endSeq) - Math.min(b.startSeq, b.endSeq))
+  if (hits.length === 0) return undefined
+  return hits.map((item) => item.note).join('\n')
+}
+
+/**
+ * 机械描述行（兜底 b）：从 surface 元数据生成，不含任何模型摘要。给指针块的
+ * 读者最低限度的定位信息（该段范围 + 行数 + 体积 + 工具构成）。
+ */
+export function mechanicalSpanLine(start: number, end: number, messages: number, tokens: number, toolMessages: number): string {
+  return `Segment sketch (mechanical, from surface metadata): seqs ${start}..${end} — ${messages} message(s), ~${tokens}t, ${toolMessages} tool message(s).`
+}
+
+/**
  * Cut a note down to a token ceiling, keeping whole LINES from the top.
  *
  * A note written to the skeleton puts its load-bearing headings first (Task,
@@ -292,7 +401,29 @@ export function truncateNoteToCeiling(note: string, maxTokens: number): { note: 
   let used = 0
   for (const line of note.split('\n')) {
     const lineTokens = defaultCountTokens(line) + 1 // + newline
-    if (used + lineTokens > maxTokens) break
+    if (used + lineTokens > maxTokens) {
+      // A single-LINE note (no \n at all — e.g. a big TIER_SUMMARY) used to be dropped
+      // WHOLE here: kept stayed empty, the truncated note was '', and the caller's
+      // usable-token floor then rejected the distill outright — costing the model a
+      // full rewrite instead of the documented "truncating costs nothing" contract.
+      // When NOTHING is kept yet and the budget is positive, cut the line BY
+      // CHARACTERS (head-kept) instead of dropping it whole.
+      if (used === 0 && maxTokens > 0) {
+        let lo = 0
+        let hi = line.length
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi + 1) / 2)
+          if (defaultCountTokens(line.slice(0, mid)) <= maxTokens) lo = mid
+          else hi = mid - 1
+        }
+        if (lo > 0) {
+          const head = line.slice(0, lo)
+          kept.push(head)
+          used = defaultCountTokens(head)
+        }
+      }
+      break
+    }
     kept.push(line)
     used += lineTokens
   }

@@ -51,7 +51,18 @@ import {
 const bigText = (label: string, seed: number): string => longText(label, seed) + longText(`${label}b`, seed + 100)
 
 const SUMMARY = 'Auth: JWT access tokens 15 min expiry, refresh tokens in Redis 30 day TTL, '
-  + 'login in src/auth/login.ts, rate limit 10 req/min/IP, bcrypt cost 12.'
+  + 'login in src/auth/login.ts, rate limit 10 req/min/IP, bcrypt cost 12. '
+  + 'Session store: Redis key auth:session:{userId} with 30 day TTL, rotated on every '
+  + 'refresh; revocation list auth:revoke:{jti} checked in middleware/auth.ts before '
+  + 'every protected route. Tokens carry {sub, scope, iat, exp} claims signed HS256 '
+  + 'with key from env AUTH_SECRET, rotated monthly via scripts/rotate-auth-secret.sh. '
+  + 'Login flow: POST /auth/login -> bcrypt.compare -> issue access+refresh pair, '
+  + 'refresh POST /auth/refresh validates the refresh token against Redis and the '
+  + 'revoke list, then re-issues. Rate limit lives in middleware/rateLimit.ts '
+  + '(10 req/min/IP, sliding window in Redis INCR + EXPIRE 60). Open objective: '
+  + 'migrate the HS256 secret to RS256 keypair before the Q1 audit; the rotation '
+  + 'script currently writes only the symmetric key. Verified: login e2e green, '
+  + 'refresh rotation covered by tests/auth/refresh.test.ts.'
 
 function makeEnv(): ToolEnvironment {
   return {

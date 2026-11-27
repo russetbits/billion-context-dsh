@@ -874,11 +874,11 @@ export const DEFAULT_FOLD_FLOOR_PCT = 0.15
  * Smallest stretch a condense may fold: the smallest span that can carry a handoff note
  * this host's models actually write inside the note-weight cap — `400 / 0.35`, rounded up
  * (1143; 2026-11-25: `TYPICAL_HANDOFF_NOTE_TOKENS` re-measured at 400 after the doctrine
- * moved to the Appendix-A four-field briefing — see src/tools.ts for the distribution).
+ * moved to the Appendix-A six-field briefing — see src/condense-note.ts for the distribution).
  * Moved here so the NUDGE can test the same number without importing the tool
  * layer (tools.ts imports nudge.ts, so the reverse import would be a cycle). The two
  * factors must stay equal to `TYPICAL_HANDOFF_NOTE_TOKENS` / `MAX_NOTE_WEIGHT_RATIO` in
- * src/tools.ts — a test pins that equality so the pair cannot drift.
+ * src/condense-note.ts — a test pins that equality so the pair cannot drift.
  *
  * F13 (cross-review 2026-11-25, accepted residual window): a span between
  * 1143 and 4286 tokens can clear this election floor and then still be refused
@@ -1462,9 +1462,10 @@ export function newestSkillCatalogSeqOf(session: Session): number | null {
  * instruction with no error to notice — the fallback then is to offer no
  * foldable instruction rows at all (return an empty set), not to keep folding.
  *
- * Only an explicit caller opts in (foldStaleInstructionRows, used by condense).
- * The nudge range table never does: a stale copy stays a WALL there, so a span the
- * model names can never reach across policy rows it might still need.
+ * Only an explicit caller opts in (foldStaleInstructionRows — the condense
+ * election, the nudge range table and the emergency overflow pool all do). A
+ * caller that keeps the default folds nothing: the stale row then stays a WALL
+ * that splits a span, never an offered candidate.
  */
 export function staleInstructionRowsOf(session: Session): Set<number> {
   const newest = newestInstructionSeqsOf(session)
@@ -1720,11 +1721,13 @@ function compressibleSegmentsOf(
       // a model that keeps compressing them loops forever (live-measured: 20 of
       // 43 compressions in a long session re-triggered an injection within 7
       // events; observed again live, where a compress that absorbed the oldest instruction
-      // row saw the host re-inject it tens of thousands of events later). Stale copies stay barriers
-      // here too; the system-side GC that removes them lands separately
-      // (instruction hygiene PR2). A SUPERSEDED copy cannot come back, so a caller
-      // reclaiming a long session may opt in (foldStaleInstructionRows) and fold
-      // it; the CURRENT copy stays a wall on every path. Engine-authored metadata
+      // row saw the host re-inject it tens of thousands of events later). Stale copies
+      // are opt-in foldable: `foldStaleInstructionSeqs` (derived from
+      // `staleInstructionRowsOf`) admits them — folding a SUPERSEDED copy while the
+      // newest stays visible cannot come back, and the condense election, the nudge
+      // range table and the emergency pool all opt in. The CURRENT copy stays a
+      // wall on every path (it sits in `protectedSeqs` AND outside the stale set).
+      // Engine-authored metadata
       // rows (nudge echo, compress-pair stub) fall through and stay foldable.
       || (classifySurfaceEvent(event) === 'instruction' && !foldableInstructionSeqs.has(seq))
     ) {

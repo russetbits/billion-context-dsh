@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { createCore, defaultCountTokens, type CompressionCore, type NudgeDecision } from 'acp-kernel'
+import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
+import { MIN_CONDENSE_SPAN_TOKENS } from '../src/region.ts'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { AcpStateStore } from '../src/state.ts'
@@ -430,12 +432,15 @@ test('M4/P0-2: range table rows are ordered by rewrite-point cost ascending (= l
   // Tool pairs separated by AGENT-INSTRUCTION walls: a guarded row is never offered
   // and always splits the range, so each tool pair becomes its own row with a
   // DIFFERENT rewrite point (later rows are cheaper — that is the ordering under test).
+  // One DISTINCT scope per wall so every row stays the NEWEST copy of its scope —
+  // stale rows are now opt-in foldable and would not split; newest copies remain
+  // walls on every path, which is the geometry this ordering test needs.
   const session = Session.create('range-table-order')
   const wall = (digest: string): void => {
     session.append('user/message', {
       turn: 1, step: 1,
       message: { role: 'user', content: [{ type: 'text', text: 'Instructions v' + digest + ': ' + longText('instr' + digest, 77) }], provider: 'test-provider', model: 'test-model' },
-      source: { kind: 'agent-instructions', form: 'instructions', baseline: true, changes: [{ action: 'set', scope: './\u0000AGENTS.md', path: 'AGENTS.md', digest }] },
+      source: { kind: 'agent-instructions', form: 'instructions', baseline: true, changes: [{ action: 'set', scope: './w' + digest + '\u0000AGENTS.md', path: 'AGENTS.md', digest }] },
     } as never, { surfaceOp: 'append' })
   }
   for (let index = 1; index <= 4; index += 1) {
@@ -452,4 +457,43 @@ test('M4/P0-2: range table rows are ordered by rewrite-point cost ascending (= l
   for (let index = 1; index < costs.length; index += 1) {
     assert.ok(costs[index]! >= costs[index - 1]!, 'row ' + index + ' is not cheaper than its predecessor: ' + costs.join(', '))
   }
+})
+
+test('M4: range table drops rows below MIN_CONDENSE_SPAN_TOKENS (never electable dead rows)', () => {
+  // Live observation (a live session): a row `seq 8937..8937 · 25t · payback 488.5`
+  // listed a span the condense election can NEVER pick — the capacity gate's first
+  // half requires folded >= MIN_CONDENSE_SPAN_TOKENS (src/region.ts, ~1143t), so a
+  // below-threshold row is pure line noise that can steer the model at a span the
+  // tool will refuse. One large span plus one tiny span: only the large one is shown.
+  const session = Session.create('range-table-dead-row')
+  session.append('turn/start', { turn: 1 })
+  appendUser(session, longText('big', 1))
+  appendToolCall(session, longText('call', 2), 'call-big', 1)
+  appendToolResult(session, longText('res', 3), 'call-big', 1)
+  const tiny = 'tiny ' + 'abcdefghijklmnopqrstuvwxyz0123456789'.repeat(2)
+  for (let i = 0; i < 6; i++) {
+    if (i % 2 === 0) appendUser(session, tiny)
+    else session.append('assistant/message', { turn: 1, step: i, stream: [], message: createAssistantMessage({ content: [{ type: 'text', text: tiny }], provider: 'test-provider', model: 'test-model' }) }, { surfaceOp: 'append' })
+  }
+  const text = rangeTable(session, wholeSurfaceRangeView(session))
+  const tokens = [...text.matchAll(/~(\d+)t tool/g)].map((match) => Number(match[1]))
+  assert.ok(tokens.length >= 1, 'the large span survives the filter')
+  for (const value of tokens) {
+    assert.ok(value >= MIN_CONDENSE_SPAN_TOKENS, 'no row below the election floor remains: ' + tokens.join(', '))
+  }
+  assert.doesNotMatch(text, /payback \d\d\d\./, 'no tiny-row absurd payback (e.g. payback 488.5) survives')
+})
+
+test('M4: a range table whose every row is below MIN_CONDENSE_SPAN_TOKENS is empty (early return)', () => {
+  // All-tiny surface: kernel ranges exist but every one is under the election
+  // floor, so the table must collapse to '' — the same early return as a
+  // zero-range surface — instead of printing a dead-row list.
+  const session = Session.create('range-table-all-tiny')
+  session.append('turn/start', { turn: 1 })
+  const tiny = 'tiny ' + 'abcdefghijklmnopqrstuvwxyz0123456789'.repeat(2)
+  for (let i = 0; i < 30; i++) {
+    if (i % 2 === 0) appendUser(session, tiny)
+    else session.append('assistant/message', { turn: 1, step: i, stream: [], message: createAssistantMessage({ content: [{ type: 'text', text: tiny }], provider: 'test-provider', model: 'test-model' }) }, { surfaceOp: 'append' })
+  }
+  assert.equal(rangeTable(session, wholeSurfaceRangeView(session)), '', 'every row below the floor → no table at all')
 })

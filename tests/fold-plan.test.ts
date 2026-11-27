@@ -43,11 +43,13 @@ test('A-9: 重叠区间按不相交子集求和（下界），不重复计收益
   // （贪心按 end 会让 907..941 挤掉 881..951，只报 12768 —— 少 21%）
   assert.equal(plan.reclaimTokens, 15926)
   assert.equal(plan.rows, 2)
-  // H1 (cross-review 2026-11-25): cost = the LAST member's foldCostTokens (the tool's
-  // `suffix[last span end + 1]`), i.e. the tail row 956..1034's 39112 — not the
-  // head-relative net kept size (35858).
-  assert.equal(plan.foldCostTokens, 39112)
-  assert.ok(Math.abs(plan.paybackRequests - 39112 / 15926) < 1e-9)
+  // Batch merge price (measured 2026-11-27): cost = suffixAtHeadStart − reclaim
+  // = (head.tokens + head.foldCostTokens) − reclaim = (4426 + 46458) − 15926
+  // = 34958. The earlier H1 value (39112, the tail row's own price) dropped the
+  // kept rows BETWEEN the spans out of the quote — the under-pricing this file's
+  // header measured on the live 6-row batch.
+  assert.equal(plan.foldCostTokens, 34958)
+  assert.ok(Math.abs(plan.paybackRequests - 34958 / 15926) < 1e-9)
 })
 
 test('A-9: 单个区间也给回本建议（比例判定对单段同样成立）', () => {

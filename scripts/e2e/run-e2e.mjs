@@ -86,15 +86,17 @@ const nudgeTableChecks = (result) => {
   const table = nudgeTableOf(result.requests)
   if (!table) return [['nudge range table present', false, 'no nudge with a range table found']]
   const rows = table.split('\n').filter((line) => /seq \d+\.\.\d+/.test(line) && /tool\d+%/.test(line))
-  const starts = rows.map((line) => {
-    const match = line.match(/seq (\d+)\.\./)
+  const costs = rows.map((line) => {
+    const match = line.match(/fold ~(\d+)/)
     return match ? parseInt(match[1], 10) : -1
   })
-  const ascending = starts.length >= 1 && starts.every((value, i) => i === 0 || value >= starts[i - 1])
+  // 2026-11-24 cross-review G1: rows are ordered by rewrite-point cost ascending
+  // (the cheapest re-prefill first), no longer oldest-first.
+  const ascending = costs.length >= 1 && costs.every((value, i) => i === 0 || value >= costs[i - 1])
   return [
-    ['nudge range table header (oldest first)', table.includes('Ranges (') && table.includes('oldest first'), ''],
+    ['nudge range table header (cheapest rewrite point first)', table.includes('Ranges (') && table.includes('cheapest rewrite point first'), ''],
     ['nudge range rows carry the tool/text share', rows.length >= 1, `rows=${rows.length}`],
-    ['nudge range rows oldest-first (ascending seq)', ascending, `starts=${starts.join(',')}`]
+    ['nudge range rows cheapest-first (ascending foldCostTokens)', ascending, `foldCosts=${costs.join(',')}`]
   ]
 }
 const checksBasic = (result) => {

@@ -186,9 +186,9 @@ export interface FoldPlan {
   readonly paybackRequests: number
 }
 
-/** 手写摘要的常驻成本。2026-11-25 随 doctrine 收紧为 Appendix-A 四件套简报，
+/** 手写摘要的常驻成本。2026-11-25 随 doctrine 收紧为 Appendix-A 六字段简报，
  *  从真机实测分布（s2115 n=56 / s5e5c n=33，p50 ~480t）重定为 400，
- *  与 src/tools.ts 的 TYPICAL_HANDOFF_NOTE_TOKENS 保持同一依据。 */
+ *  与 src/condense-note.ts 的 TYPICAL_HANDOFF_NOTE_TOKENS 保持同一依据。 */
 export const TYPICAL_NOTE_TOKENS = 400
 
 /**
@@ -236,14 +236,18 @@ export function foldPlanOf(
     }
     const reclaim = set.reduce((sum, range) => sum + range.tokens, 0)
     if (reclaim <= notesTokens) continue
-    // H1 (cross-review 2026-11-25): price the batch EXACTLY as the tool does —
-    // `foldCostTokens` is `suffix[last span end + 1]`, what the next request must
-    // re-prefill ONCE. The old head-relative `suffixAtStart - reclaim + notesTokens`
-    // was the NET KEPT size: on one 5-row batch it quoted 17314 while the tool billed
-    // 9541, and the footer called that number "one re-prefill". Two prices for one
-    // fold is the drift this change exists to remove.
-    const tail = set[set.length - 1]!
-    const cost = Math.max(0, tail.foldCostTokens)
+    // Batch merge price (measured 2026-11-27, probe-batch fixture): a multi-span
+    // batch's durable replace rewrites the surface at the EARLIEST span's start
+    // edge, so the one re-prefill is everything after that edge minus what the
+    // fold removes. `suffixAtStart = head.tokens + head.foldCostTokens` restores
+    // the suffix AT the head's start (`head` IS `set[0]` — the greedy walk starts
+    // at `index`); the H1 `tail.foldCostTokens` read the LAST span's end instead —
+    // the kept rows (walls, guarded rows) BETWEEN the spans dropped out of the
+    // quote and under-priced a 6-row live batch by ~3×. For a single-span set this
+    // reduces to `head.foldCostTokens` exactly (startIdx − tokens = endIndex+1
+    // for a contiguous span).
+    const suffixAtStart = head.tokens + head.foldCostTokens
+    const cost = Math.max(0, suffixAtStart - reclaim)
     // THE SAME gate `pickCondenseSpan` applies, on the BATCH's own numbers:
     // the capacity (working-set floor) gate — M-3 (2026-11-25) removed the payback /
     // cost ceilings as gates, so the recommendation here and the tool's verdict can
@@ -298,7 +302,7 @@ export function meterMediaPriceResolver(
  * `1.0` — the payback period in requests (`foldCost / tokens`), one decimal. `—` when the
  * row removes nothing (a ratio against zero is meaningless, not infinite on screen).
  *
- * NOT the same function as `tools.ts:formatPayback` on purpose: that one feeds refuse/
+ * NOT the same function as `condense-note.ts:formatPayback` on purpose: that one feeds refuse/
  * recommend COPY and returns `∞`, because "it never pays back" is the fact being stated;
  * this one fills a TABLE CELL where a zero-span row simply has no ratio, so `—` is right
  * and `∞` would read as a measured value. Keep both intents; do not merge them.
@@ -317,6 +321,34 @@ export function rangeTable(
   mediaPriceOf?: MediaPriceOf,
   foldPricing?: FoldPricing,
 ): string {
+  // Table-election alignment (2026-11-27, live session seq4356→4376): the
+  // distillation candidates (the ACTIVE block carriers) are visible to the
+  // condense election but stay OUT of `buildCompressibleSeqRanges`' geometry
+  // (checkpoints are their own class, rule 3), so the model could never see
+  // them as a table choice — and rule 7 makes distillation an EXPLICIT act.
+  // Advertise the oldest..newest carrier pair as a dedicated `distill` line so
+  // the model can point the call itself; block refs are what acp_status's
+  // Checkpoint seqs row shows. Computed BEFORE the early returns so an empty
+  // table still carries the line (fragmented surface = the case where the
+  // explicit call is the only working move). Read-only: log-derived.
+  const liveCarriers = blockRegistry(session).filter((entry) => entry.active && entry.summarySeq !== null).length
+  let distillLine: string | null = null
+  if (liveCarriers >= 2) {
+    const nodeIndexOf = new Map<number, number>()
+    const nodes = session.surface.nodes
+    for (let index = 0; index < nodes.length; index += 1) nodeIndexOf.set(nodes[index] as number, index)
+    const carriers = blockRegistry(session)
+      .filter((entry) => entry.active && entry.summarySeq !== null && nodeIndexOf.has(entry.summarySeq))
+      .map((entry) => ({ entry, index: nodeIndexOf.get(entry.summarySeq as number) as number }))
+      .sort((a, b) => a.index - b.index)
+    const oldest = carriers[0]!
+    const newest = carriers[carriers.length - 1]!
+    if (oldest.entry.kernelBlockId !== newest.entry.kernelBlockId) {
+      distillLine = 'distill: ' + oldest.entry.kernelBlockId + '..' + newest.entry.kernelBlockId
+        + ' (checkpoint seqs ' + (oldest.entry.summarySeq as number) + '..' + (newest.entry.summarySeq as number) + ', ' + carriers.length + ' blocks)'
+        + ' — explicit tier-2 distill: compress({ content: [{ startSeq: \'' + oldest.entry.kernelBlockId + '\', endSeq: \'' + newest.entry.kernelBlockId + '\', summary: \'<note>\' }] }) — the originals behind those blocks stop being readable at message level; acp_status shows every block\'s Checkpoint seq.'
+    }
+  }
   // Duplicate spans (the kernel's multi-call sub-id edges for ONE seq range) are removed by
   // `buildCompressibleSeqRanges` itself, so the six rows the model sees are six different
   // stretches of work AND every other caller sees the same deduped list — one source, no
@@ -326,6 +358,14 @@ export function rangeTable(
     kernelView,
     {
       ...(mediaPriceOf === undefined ? {} : { mediaPriceOf }),
+      // Stale instruction rows (superseded AGENTS.md injections, superseded skill
+      // catalogs) are foldable for real — folding one while its newest copy stays
+      // visible never re-triggers an injection (rule 16, live-measured) — so they
+      // must not chop a span into fragments here. `compressibleSegmentsOf` still
+      // flushes at the CURRENT copy of every scope: that copy sits in
+      // `protectedSurfaceSeqs` AND outside `staleInstructionRowsOf`, so the newest
+      // row remains a wall on every path and no offered span can cover it.
+      foldStaleInstructionRows: true,
       // A row's price is the surface suffix after its END edge. The fixed request
       // head sits BEFORE every rewrite point, so it is outside this price; adding
       // the paired overhead here double-counted it (round-10 review B1; the older
@@ -334,14 +374,33 @@ export function rangeTable(
     },
   )
   // 零范围:整块省略(保留现状的提前返回与 nudge 尾部 '\n')。
-  if (allRanges.length === 0) return ''
+  // EXCEPTION — the distill line: a fragmented surface (zero rows) is exactly
+  // where the explicit distill call is the ONLY working move, so the line is
+  // computed BEFORE the early returns and survives them alone.
+  const distillOnlyTable = (): string => distillLine === null
+    ? ''
+    : [
+        '',
+        renderTemplate(prompts.rangeTable.header, { surface: surfaceSummary(session) }),
+        distillLine,
+        prompts.rangeTable.footer,
+      ].join('\n')
+  if (allRanges.length === 0) return distillOnlyTable()
+  // 低于 MIN_CONDENSE_SPAN_TOKENS 的行在 condense 选举里永远不可当选：选举的
+  // capacity 闸第一半要求 folded >= 该阈值（condense-elect 的三闸之一），而表行
+  // 是模型 condense/content 选举的唯一输入，列出来只会占行数并误导模型去选一段
+  // 必被拒的跨度（实机出现过 `seq 8937..8937 · 25t · payback
+  // 488.5` 这种死行）。唯一例外是 cross-barrier distill 顺带折 gap，它不依赖表行。
+  // 0 候选时走上面的空表提前返回。
+  const candidates = allRanges.filter((range) => range.tokens >= MIN_CONDENSE_SPAN_TOKENS)
+  if (candidates.length === 0) return distillOnlyTable()
   // Cheapest rewrite point FIRST, not oldest first (cross-review 2026-11-24 G1).
   // `foldCostTokens` is everything after the rewrite point, so ascending order is
   // also the latest-first order: an earlier rewrite point re-reads more. The old
   // `slice(0, 6)` on an oldest-first array showed the six MOST EXPENSIVE rows while
   // the same payload's footer told the model to prefer the LATEST ones — the table
   // and its own advice disagreed, and the model followed the table.
-  const ranges = [...allRanges]
+  const ranges = [...candidates]
     .sort((a, b) => a.foldCostTokens - b.foldCostTokens || a.start - b.start)
     .slice(0, 6)
   // 计划只对**表里列出的**这几段求和：rows 与 reclaim 必须是模型看得见的东西。
@@ -352,12 +411,11 @@ export function rangeTable(
   const plan = foldPlanOf(ranges, TYPICAL_NOTE_TOKENS, foldPricing)
   // Barriers that a fragment surface strands. `blockRegistry` is log-derived (no surface
   // write), so this stays a read-only computation.
-  const liveCarriers = blockRegistry(session).filter((entry) => entry.active && entry.summarySeq !== null).length
   // The condition is "a plain batch cannot pass the gates", not "every row is tiny":
   // rows can be large and still unreachable (a long protected tail makes every rewrite
   // point too expensive), and in that case the cross-barrier fold is still the way out.
   const obstacleLine = liveCarriers >= 2 && plan === null
-    ? [`obstacle: barriers ${liveCarriers}, no plain fold clears the working-set gate (each foldable stretch is under the ${MIN_CONDENSE_SPAN_TOKENS}t a note-carrying fold needs) \u2014 folding across the carriers is the only way forward: compress({ condense: { summary } }) folds them in ONE transaction (tier 2 \u2014 the originals behind those carriers become unrecoverable at message level, and the result says so).`]
+    ? [`obstacle: barriers ${liveCarriers}, no plain fold clears the working-set gate (each foldable stretch is under the ${MIN_CONDENSE_SPAN_TOKENS}t a note-carrying fold needs) \u2014 distill explicitly instead: compress({ content: [{ startSeq: 'bN', endSeq: 'bM', summary }] }) over the carriers (see the distill line below; block-id boundaries are the tier-2 distill path — condense itself refuses to fold across them).`]
     : []
   const lines = ranges.map((range) =>
     renderTemplate(prompts.rangeTable.line, {
@@ -392,6 +450,10 @@ export function rangeTable(
           fold: plan.foldCostTokens,
           payback: plan.paybackRequests.toFixed(1),
         })]),
+    // The explicit DISTILL candidate (table-election alignment, 2026-11-27): a
+    // dedicated line advertising the oldest..newest carrier pair so the model
+    // can point a tier-2 call itself instead of hoping the election picks it.
+    ...(distillLine === null ? [] : [distillLine]),
     // A FRAGMENTED surface is a different failure from an expensive one: every gap is
     // under the note-carrying minimum, so no plain fold can qualify no matter how long
     // the model waits. The move that still works is folding ACROSS the carriers, which
@@ -481,6 +543,27 @@ export function computeSurfaceBreakdown(
  * user turn). Normal-pressure nudges remain limited to one per turn regardless.
  */
 export const EMERGENCY_NUDGE_MAX_PER_TURN = 3
+
+/**
+ * 方案 D layer 1 — the HARD emergency nudge rider. The kernel's own emergency
+ * copy ("compress now") is still phrased as a recommendation; once the host's
+ * compaction-basic passive fallback is disabled, this line is the only thing
+ * standing between a ≥emergency-threshold session and a provider 400. It is an
+ * ACTION INSTRUCTION, not advice: the model must call compress with a condense
+ * IN THIS STEP. Rendered after the kernel text (never replacing it) and passed
+ * through the PTC call-shape rewrite like every other model-visible line, so
+ * the call form matches the session's calling convention.
+ */
+export const EMERGENCY_ACTION_RIDER_NATIVE =
+  'ACTION REQUIRED THIS STEP: context is at or above the emergency threshold. Call compress({ condense: { summary } }) NOW, before doing anything else in this turn — the next request may be rejected outright if you do not. Fold a row that STILL LEAVES the floor (a non-below-floor row in the table; if every row is below floor, pick the one the table says does not strand the working set).'
+
+/** The same instruction for a PTC / code-mode session (src/ptc.ts call shape). */
+export const EMERGENCY_ACTION_RIDER_PTC =
+  'ACTION REQUIRED THIS STEP: context is at or above the emergency threshold. Call await tools.compress({ condense: { summary } }) from inside `run_code` NOW, before doing anything else in this turn — the next request may be rejected outright if you do not. Fold a row that STILL LEAVES the floor (a non-below-floor row in the table; if every row is below floor, pick the one the table says does not strand the working set).'
+
+export function emergencyActionRider(style: ResolvedCallStyle): string {
+  return style === 'ptc' ? EMERGENCY_ACTION_RIDER_PTC : EMERGENCY_ACTION_RIDER_NATIVE
+}
 
 /**
  * Decide and build one nudge message for the agent's next pre-step. Returns
@@ -648,7 +731,12 @@ export function buildNudgeText(
   // assistant text), so the nudge we are already injecting is the only channel
   // that can name the failure. Gated on the mode: in native mode the direct
   // shape works, so the flag means nothing there.
-  return leakNote && style === 'ptc' ? `${text}\n\n${PTC_LEAK_CORRECTION}` : text
+  let out = leakNote && style === 'ptc' ? `${text}\n\n${PTC_LEAK_CORRECTION}` : text
+  // 方案 D layer 1: at the emergency tier the copy escalates from advice to an
+  // action instruction (the passive fallback the host's compaction-basic
+  // provided is gone). Rendered through ptcText so the call shape matches the
+  // session's convention without a second rewrite path.
+  return emergency ? `${out}\n\n${ptcText(EMERGENCY_ACTION_RIDER_NATIVE, style)}` : out
 }
 
 /**

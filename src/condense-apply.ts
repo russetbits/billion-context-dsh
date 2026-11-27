@@ -64,7 +64,7 @@ import type { SettingsCommandSurface } from './settings.ts'
 import type { PresetName } from './presets.ts'
 import { parseBoundary, CompressArgs, unwrapCompressArgs, validateContentItems } from './compress-args.ts'
 import { CondenseSpan, CondensePick, CondenseMiss, indexOfSurfaceSeq, condenseNoteBudget, condenseRangesOf, pickCondenseSpan } from './condense-elect.ts'
-import { formatPayback, condenseFloorRefusal, missingCondenseHeadings, condenseNoteGaps, MAX_NOTE_WEIGHT_RATIO, MAX_HANDOFF_NOTE_TOKENS, CONDENSE_BATCH_SPLIT_TOKENS, truncateNoteToCeiling, noteWeightRatio, noteWeightRejection } from './condense-note.ts'
+import { formatPayback, condenseFloorRefusal, missingCondenseHeadings, condenseNoteGaps, describePrefixSpans, MAX_NOTE_WEIGHT_RATIO, MAX_HANDOFF_NOTE_TOKENS, CONDENSE_BATCH_SPLIT_TOKENS, truncateNoteToCeiling, noteWeightRatio, noteWeightRejection, normalizeSegmentNotes, segmentNoteForSpan, mechanicalSpanLine, type SegmentSpanNote } from './condense-note.ts'
 import { ToolEnvironment, TextOutput, requireAgent, resolveEffectiveWindow, guardedRowsInSpan, splitAroundProtected, splitPiecePosition, splitCoverageLine, liveCarrierRejectionNote, protectedRowRejectionNote, edgeRefForSeq } from './shared.ts'
 
 /** Strip the creation-time frame prefix the stored checkpoint node carries (region.ts framedSummary). */
@@ -213,7 +213,16 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   // and output tokens cost several times what an uncached input token does —
   // a retry loop is the single most expensive failure mode this tool has.
   const condenseNoteAdvisories: string[] = []
+  // Batch note dedup (B 方案) group state, allocated at the condense synthesis
+  // site (below) and consumed in the ranges loop.
+  let noteGroupCounter = 0
+  let condenseBatchGroup: { group: number } | undefined
+  // 段级 note（2026-11-27）：`condense.spans` 由模型逐段写，批内指针块用它区分
+  // 每段的细节；模型没写时指针块落机械描述行。只在 condense 分支读，普通
+  // content 路径为空数组 → segmentNoteForSpan 恒 undefined，零影响。
+  let segmentNotes: SegmentSpanNote[] = []
   if (args.condense !== undefined) {
+    segmentNotes = normalizeSegmentNotes(args.condense.spans)
     if (args.content !== undefined) {
       return { text: 'compress: condense and content are mutually exclusive — pass one or the other' }
     }
@@ -238,7 +247,7 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       )
       return {
         text: 'compress: condense folded nothing — ' + pick.reason + '.\n'
-          + 'Compare against the automatic checkpoint it replaces: a host checkpoint costs a fully cold prefill (~130 s here), so waiting is cheaper only while nothing is consumed.\n'
+          + 'For scale: a host checkpoint re-prefills everything cold (~130 s here); folding here costs a fraction of that — waiting is cheaper only while nothing is consumed.\n'
           + (rows.length > 0
             ? 'Eligible runs you can fold explicitly:\n' + rows.join('\n')
             : 'No eligible run yet — keep working; consumed spans reappear in the next nudge.'),
@@ -266,7 +275,10 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     // unrecoverable loss, not a slow session).
     const gateFailed = !pick.gates.capacity
     if (gateFailed && !forced) {
-      return { text: condenseFloorRefusal(pick, floor) }
+      // P-a (live session 011470e0): the request-input live disambiguates the two
+      // "live" figures — 0 (no billed row yet) falls back to the fixed-head note.
+      const requestLive = lastRequestInput(session)
+      return { text: condenseFloorRefusal(pick, floor, requestLive > 0 ? requestLive : undefined) }
     }
 
     // Priced as the note is STORED: the summary frame prefix the checkpoint node carries
@@ -347,13 +359,17 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
         // F5 (cross-review 2026-11-25): everything the result line and the follow-up
         // logic report must describe what THIS call actually submitted, not the
         // whole batch it declined to submit in one go. Re-price the pick against
-        // batch 1: the fold cost is unchanged (the earliest rewrite point —
-        // spans[0].start — belongs to batch 1 either way), but the saving, the
-        // note denominator, the kept tokens and the payback all change.
+        // batch 1: the saving, the note denominator, the kept tokens and the
+        // payback all change. The re-prefill price changes too (batch merge
+        // formula, measured 2026-11-27): the rewrite point is the earliest span's
+        // start edge — shared by every batch — but batch 1 removes less, so the
+        // rows this call does NOT fold stay in the suffix it must re-prefill:
+        // batch1Cost = pickCost + (pickTokens − submittedTokens).
         const surfaceTotal = pick.keptTokens + pick.tokens + pick.noteTokens
         const submittedNoteBudget = condenseNoteBudget(submittedTokens)
         const submittedKept = Math.max(0, surfaceTotal - submittedTokens - submittedNoteBudget)
-        const payback = submittedTokens > 0 ? pick.foldCostTokens / submittedTokens : Number.POSITIVE_INFINITY
+        const batch1FoldCost = pick.foldCostTokens + Math.max(0, pick.tokens - submittedTokens)
+        const payback = submittedTokens > 0 ? batch1FoldCost / submittedTokens : Number.POSITIVE_INFINITY
         condensePick = {
           ...pick,
           spans: spansToSubmit,
@@ -363,6 +379,7 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
           belowFloor: belowWorkingSetFloor(surfaceTotal, submittedKept, pick.floorTokens),
           carrierCount: spansToSubmit.reduce((total, span) => total + span.carriers.length, 0),
           distilledBlocks: 0,
+          foldCostTokens: batch1FoldCost,
           paybackRequests: payback,
           gates: {
             capacity: submittedTokens >= MIN_CONDENSE_SPAN_TOKENS
@@ -386,10 +403,133 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
         verifiedReadings: args.condense!.verifiedReadings,
       })),
     }
+    // Batch note dedup (B 方案, 2026-11-26): a multi-span batch shares ONE note —
+    // only the FIRST landed block carries the full text, later blocks get a
+    // pointer line naming this block. Allocated ONCE per batch, before the
+    // ranges loop; a single-span batch (the common case) gets no group and
+    // stores the note exactly as before.
+    condenseBatchGroup = spansToSubmit.length > 1 ? { group: ++noteGroupCounter } : undefined
   }
   // Items-level required check AFTER the envelope peel (see
   // validateContentItems for why the schema gate alone cannot do this).
   validateContentItems(args.content!)
+
+  // 蒸馏产物截断预算（2026-11-27）：显式 content 蒸馏路径此前没有任何大小约束，
+  // T2/T3 summary 膨胀的结构性根源——蒸馏输出把被替换的块摘要原样抄一遍甚至加长，
+  // 每个 checkpoint 节点都常驻后续请求。基准 = 该项 span 吸收的 active 块的
+  // summary tokens（frame prefix 计价，与 weight gate 同一口径）；上限 = 基准
+  // × 0.6（被吸收块全是 tier1）或 × 0.4（任一被吸收块 tier>=2——T3 是对 T2
+  // 产物的再蒸馏，份额必须更小）。超限截断（保头砍尾）+ advisory；截断后剩余
+  // 过薄（<200t）说明产物已不成立 → 拒绝该项并给引导。基准不可得（span 不吸收
+  // 任何 active 块的 checkpoint，或基准为 0）→ fail-open，不截断。
+  // 只作用于模型显式 content 项：condense 合成的批已过自己的 weight gate
+  // （distill 以 max(tokens, MIN_CONDENSE_SPAN_TOKENS) 为基准），不重复约束。
+  const distillBudgetNotes: string[] = []
+  if (!condenseSynthesizedRange) {
+    const frameTokens = defaultCountTokens(SUMMARY_FRAME_PREFIX)
+    // Smallest ceiling a distill may land under (lead ruling 2026-11-27, three-band
+    // floor): the kernel's own summary minimum is 50 chars ≈ 13t; below ~120t even
+    // the SOURCE summaries are too thin to distill into a readable briefing, so the
+    // item is REJECTED with guidance instead of being truncated to a sliver.
+    const MIN_DISTILL_SOURCE = 120
+    const kept: NonNullable<CompressArgs['content']> = []
+    for (const item of args.content!) {
+      // bN / mN 边界必须先解析成 surface seq：Number('b4')=NaN 会让
+      // shadowedSeqsOf 落进 catch → fail-open，蒸馏预算对 T2/T3 调用完全失效。
+      let lo: number
+      let hi: number
+      try {
+        const startSeq = parseBoundary(item.startSeq, byRef, session)
+        const endSeq = parseBoundary(item.endSeq, byRef, session)
+        lo = Math.min(startSeq, endSeq)
+        hi = Math.max(startSeq, endSeq)
+      } catch {
+        kept.push(item)
+        continue
+      }
+      let span: readonly number[]
+      try {
+        span = shadowedSeqsOf(session, lo, hi)
+      } catch {
+        kept.push(item)
+        continue
+      }
+      const registry = blockRegistry(session)
+      const ledgerByBlockId = new Map(rebuildBlockLedger(sessionEventsOf(session)).map((entry) => [entry.blockId, entry]))
+      const absorbed = registry.filter(
+        (entry) => entry.active && entry.summarySeq !== null && span.includes(entry.summarySeq),
+      )
+      if (absorbed.length === 0) {
+        kept.push(item)
+        continue
+      }
+      const base = absorbed.reduce((total, entry) => {
+        const ledgerEntry = ledgerByBlockId.get(entry.blockId)
+        if (ledgerEntry === undefined) return total
+        return total + defaultCountTokens(withSummaryFramePrefix(ledgerEntry.summary))
+      }, 0)
+      if (base <= 0) {
+        kept.push(item)
+        continue
+      }
+      const anyTierAbove1 = absorbed.some((entry) => entry.tier >= 2)
+      const ratio = anyTierAbove1 ? 0.4 : 0.6
+      const ceiling = Math.floor(base * ratio)
+      const summaryTokens = defaultCountTokens(withSummaryFramePrefix(item.summary))
+      if (summaryTokens <= ceiling) {
+        kept.push(item)
+        continue
+      }
+      // 截断目标扣掉 frame prefix：truncateNoteToCeiling 按裸文本计行，
+      // 而预算按 STORED 形态计（weight gate 同款口径）。
+      const cut = truncateNoteToCeiling(item.summary, Math.max(0, ceiling - frameTokens))
+      const cutTokens = defaultCountTokens(withSummaryFramePrefix(cut.note))
+      // The usable-token floor is capped BY THE BUDGET, in THREE bands (lead
+      // ruling 2026-11-27):
+      //   ceiling >= 200t  — normal truncation path (head-kept cut).
+      //   120t..200t       — the SOURCE is small (the ceiling tracks the source
+      //                      summaries), so the distill output is roughly the
+      //                      source's own size: no bloat to guard against. The
+      //                      note is accepted UNTRUNCATED with an advisory —
+      //                      truncating to ~120t of an 800-char-class summary
+      //                      gains nothing and broke checkpoint-span's suggested
+      //                      block-id call (kernel floor: "Summary too short,
+      //                      min 50" at 36 chars).
+      //   ceiling < 120t   — REJECT: even the source is too thin to distill
+      //                      into a briefing. (MIN_DISTILL_SOURCE ≈ kernel's
+      //                      50-char minimum ~13t, plus readable headroom.)
+      // An UNDERSIZED truncation inside the ≥200t band is still a REJECT: the
+      // model wrote a note far larger than the span can carry — rewrite, do not
+      // silently ship a sliver.
+      if (cutTokens < Math.min(200, ceiling)) {
+        if (ceiling >= MIN_DISTILL_SOURCE) {
+          // 120t..200t band: the source itself is small — accept the note as-is.
+          distillBudgetNotes.push(
+            `  distill note for seqs ${item.startSeq}..${item.endSeq} left as-is: budget ~${ceiling}t `
+            + `(source summaries Σ ~${base}t × ${ratio}) is below the ~200t truncation floor, and the source is small — `
+            + 'no truncation applied; the output is roughly the source\'s own size.',
+          )
+          kept.push(item)
+          continue
+        }
+        distillBudgetNotes.push(
+          `  seqs ${item.startSeq}..${item.endSeq} REJECTED — the distill budget for this span is ~${ceiling}t `
+          + `(source summaries Σ ~${base}t × ${ratio}), below the ~${MIN_DISTILL_SOURCE}t minimum a distill needs; `
+          + 'a truncation that fits is not a briefing. Distill FEWER source blocks per call (split the span) '
+          + 'or distill at a phase close — the other ranges in this batch are unaffected; '
+          + 'do not resend this one unchanged.',
+        )
+        continue
+      }
+      distillBudgetNotes.push(
+        `  distill note for seqs ${item.startSeq}..${item.endSeq} was ~${summaryTokens}t — truncated to ~${cutTokens}t `
+        + `(budget = source Σ ~${base}t × ${ratio}, the tail was cut). Distill = REFINE the source notes, not copy them: `
+        + 'rewrite still-relevant content shorter, fold completed entries into one-line outcomes.',
+      )
+      kept.push({ ...item, summary: cut.note })
+    }
+    args = { ...args, content: kept }
+  }
 
   // Duplicate-note gate (live another live session, 2026-11-26): two adjacent condense
   // calls landed the SAME byte-identical note (932 chars) on two INTERSECTING
@@ -420,6 +560,22 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       topic?: string
       /** B3：本段压缩时已绿的验收读数（结构化落盘）。 */
       verifiedReadings?: string[]
+      /**
+       * Batch note dedup (B 方案, 2026-11-26): when ONE compress call lands
+       * SEVERAL blocks from one shared note (a multi-span condense batch, or a
+       * range cut around protected rows), only the FIRST block carries the full
+       * note; every later block writes a one-line pointer to it instead.
+       * `group` ties the members together; position/total/first are assigned
+       * AFTER the ranges loop, over the members that actually survived to this
+       * array (so a member refused by a guard never distorts the numbering).
+       */
+      noteGroup?: { group: number }
+      /**
+       * 段级 note（2026-11-27）：模型 `condense.spans` 中与本段相交的条目
+       * （segmentNoteForSpan 拼接）。只挂在指针块分支消费；全局 note 的
+       * 权重门不读它（段级 note 是新增信息，不进 35% 预算）。
+       */
+      segmentNote?: string
     }
   > = []
   // Ranges whose whole span was already shadowed by earlier compressions.
@@ -448,6 +604,8 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   // (its stale recovery and index arithmetic both assume ordered edges) and
   // lets the advisory line name the ORIGINAL edges.
   const swappedNotes: string[] = []
+  // Batch note dedup group counter: groups of ranges in THIS call that share one
+  // note. Only groups with more than ONE landed member write pointer blocks.
   const guardedSeqs = guardedSurfaceSeqsOf(session)
   // How many content ranges this call had to cut around protected rows, and how
   // many rows it cut around. Reported in the success line so the model learns the
@@ -531,6 +689,8 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     origin: { startSeq: number; endSeq: number },
     range: NonNullable<CompressArgs['content']>[number],
     summary: string,
+    noteGroup?: { group: number },
+    segmentNote?: string,
   ): void => {
     const rangeKey = `${plan.startRef}::${plan.endRef}`
     if (seenRangeKeys.has(rangeKey)) {
@@ -555,6 +715,8 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
         : {}),
       summary,
       ...(range.topic ?? args.topic) === undefined ? {} : { topic: range.topic ?? args.topic },
+      ...(noteGroup === undefined ? {} : { noteGroup }),
+      ...(segmentNote === undefined ? {} : { segmentNote }),
     })
   }
 
@@ -568,13 +730,14 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     shadowedSpan: readonly number[],
     origin: { startSeq: number; endSeq: number },
     range: NonNullable<CompressArgs['content']>[number],
+    noteGroup?: { group: number },
   ): void => {
     const plan = planResolved(resolved, shadowedSpan)
     if ('refuse' in plan) {
       rejectedNotes.push(plan.refuse)
       return
     }
-    commitPlanned(plan, resolved, origin, range, range.summary)
+    commitPlanned(plan, resolved, origin, range, range.summary, noteGroup, segmentNoteForSpan(segmentNotes, resolved.start, resolved.end))
   }
   for (const range of args.content!) {
     let startSeq = parseBoundary(range.startSeq, byRef, session)
@@ -642,12 +805,25 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     // plain-seq case (`startBlockRef == null && endBlockRef == null`).
     const carrierHits = condenseSynthesizedRange
       ? []
-      : liveCheckpointCarriersInSpan(session, shadowedSpan)
-        .filter((carrier) => carrier.seq !== resolved.start && carrier.seq !== resolved.end)
-        .map((carrier) => carrier.seq)
+      // BOTH edges on block refs (bN..bM) = the EXPLICIT distillation call:
+      // folding the carriers inside it is the whole point of the call (the
+      // kernel records every interior block as a parent of the new one), so
+      // cutting around them would shred one distillation into 49 orphaned
+      // blocks. Carriers are protected only from a PLAIN range.
+      : (blockRefForSummarySeq(session, resolved.start) !== null
+          && blockRefForSummarySeq(session, resolved.end) !== null)
+        ? []
+        : liveCheckpointCarriersInSpan(session, shadowedSpan)
+          .filter((carrier) => carrier.seq !== resolved.start && carrier.seq !== resolved.end)
+          .map((carrier) => carrier.seq)
     const protectedHits = [...new Set([...instructionHits, ...carrierHits])]
+    // Batch note dedup (B 方案): a synthesized multi-span condense batch shares
+    // ONE note across ALL its ranges — only the first landed block carries the
+    // full text, the rest get pointers. The group is allocated ONCE for the
+    // whole batch (condenseBatchGroup, at the synthesis site), never per span.
+    const condenseGroup = condenseSynthesizedRange ? condenseBatchGroup : undefined
     if (protectedHits.length === 0) {
-      acceptResolved(resolved, shadowedSpan, { startSeq, endSeq }, range)
+      acceptResolved(resolved, shadowedSpan, { startSeq, endSeq }, range, condenseGroup)
       continue
     }
     // The condense election never hands us a span it did not price against the
@@ -715,6 +891,12 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     if (planned.length === 0) {
       rejectedNotes.push(protectedRowRejectionNote(resolved.start, resolved.end, protectedHits, shadowedSpan, session))
     } else {
+      // Batch note dedup (B 方案): a split around protected rows stores the same
+      // whole-span note in EVERY piece — with more than one piece only the
+      // FIRST landed block carries the full note, the rest get a pointer line.
+      // The coverage line (split i/N …) still rides EVERY piece, including the
+      // pointer blocks, so the batch geometry stays visible.
+      const splitGroup = planned.length > 1 ? { group: ++noteGroupCounter } : undefined
       planned.forEach((item, index) => {
         // The note the model wrote describes seqs A..B — the WHOLE requested span —
         // while this block holds one side of it. Say so, mechanically, instead of
@@ -727,12 +909,12 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
           protectedHits.length,
           item.where,
         )
-        commitPlanned(item.refs, item.resolved, { startSeq: item.startSeq, endSeq: item.endSeq }, range, coverage + range.summary)
-        // Priced as STORED: the coverage line is per-block, the note is the model's
-        // whole-span note repeated once per block.
+        commitPlanned(item.refs, item.resolved, { startSeq: item.startSeq, endSeq: item.endSeq }, range, coverage + range.summary, splitGroup, segmentNoteForSpan(segmentNotes, item.resolved.start, item.resolved.end))
+        // Priced as STORED: the coverage line is per-block. The model's whole-span
+        // note itself is no longer multiplied across pieces (batch note dedup, B
+        // 方案): pointer blocks reference the first block instead of storing it.
         splitExtraTokens += defaultCountTokens(coverage)
       })
-      splitExtraTokens += (planned.length - 1) * defaultCountTokens(withSummaryFramePrefix(range.summary))
       splitRangeCount += 1
       splitProtectedRows += protectedHits.length
       splitBlocks += planned.length
@@ -743,7 +925,7 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   // Nothing to do: every requested range was already compressed, rejected, or
   // a duplicate of an earlier range in the same call.
   if (ranges.length === 0) {
-    const text = ['Compressed 0 block(s), ~0 tokens reclaimed.', ...swappedNotes, ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes]
+    const text = ['Compressed 0 block(s), ~0 tokens reclaimed.', ...swappedNotes, ...distillBudgetNotes, ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes]
     if (alreadyCompressedNotes.length > 0) {
       text.push('  (all requested ranges were already compressed — recall a block to recover its originals)')
     } else if (duplicateRangeNotes.length > 0 && rejectedNotes.length === 0) {
@@ -807,6 +989,25 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   const lines: string[] = []
   const landedBlockIds: string[] = []
   let skippedRanges = 0
+  // Batch note dedup (B 方案) state: per group the id of the FIRST block that
+  // actually landed (it carries the full note), plus the per-group planned
+  // member count so a pointer block can state its position.
+  const groupFirstCompactionId = new Map<number, string>()
+  const groupPlannedCount = new Map<number, number>()
+  const groupLandedCount = new Map<number, number>()
+  for (const range of ranges) {
+    if (range.noteGroup !== undefined) {
+      groupPlannedCount.set(range.noteGroup.group, (groupPlannedCount.get(range.noteGroup.group) ?? 0) + 1)
+    }
+  }
+  // Groups whose later members landed as pointer blocks: group → full note as
+  // the FIRST block stored it (frame stripped), for the dedup result line.
+  const groupNotes = new Map<number, string>()
+  // Pointer lines for the result report (one per pointer block, plus a summary
+  // count line so a真机 verification can reconcile the saving).
+  const dedupLines: string[] = []
+  let dedupPointerBlocks = 0
+  let dedupSavedTokens = 0
   for (const range of ranges) {
     const key = `${range.startRef}::${range.endRef}`
     const block = blockByRangeKey.get(key)
@@ -844,11 +1045,56 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     // model switch the latter is a stale snapshot (the PREVIOUS route), so the
     // summary node would be stamped with a route the summary did not come from.
     const { provider, model } = routeFor(agent)
+    // Batch note dedup (B 方案): the FIRST member of a note group that actually
+    // lands stores the full note (unchanged); every LATER member replaces the
+    // note body with a one-line pointer to that first block. The coverage line
+    // a split block carries stays in front of the pointer (the batch geometry
+    // must remain visible). The frame prefix is added by
+    // runCompactionTransaction (prefixSummaryBlocks), so the pointer rides the
+    // SAME framed channel as every other summary.
+    let summaryText = range.summary
+    if (range.noteGroup !== undefined) {
+      const group = range.noteGroup.group
+      const firstId = groupFirstCompactionId.get(group)
+      if (firstId === undefined) {
+        // The FIRST member of this group to reach the write loop: it stores the
+        // full note and its compactionId (known only after the transaction
+        // lands, below) becomes the pointer target for the later members.
+      } else {
+        const coverageMatch = /^(\[split \d+\/\d+ [^\n]*\n)([\s\S]*)$/.exec(summaryText)
+        const pointerBody = 'Batch block ' + (groupLandedCount.get(group)! + 1) + '/' + groupPlannedCount.get(group)!
+          + ' covering seqs ' + start + '..' + end + ' — full handoff note lives in block ' + firstId
+          + '; recall({ blockId: "' + firstId + '" }) to read it back.'
+        // 段级 note（2026-11-27）：批内 dedup 后指针块只留全局 note 指针，段级
+        // 细节丢失。模型在 `condense.spans` 里逐段写了就用模型写的（主路径）；
+        // 没写则从 surface 元数据生成一行机械描述兜底（范围/行数/体积/工具构成，
+        // 引擎绝不自己摘要）。追加在指针行之后——split coverage 前缀的正则替换
+        // 只锚定第一行，追加段不受影响。
+        let pointerTail = ''
+        if (range.segmentNote !== undefined) {
+          pointerTail = '\n' + range.segmentNote
+        } else {
+          const spanSeqs = shadowedSeqsOf(session, start, end)
+          const toolCount = spanSeqs.filter((seq) => {
+            const event = eventAtOf(session, seq)
+            if (event === undefined) return false
+            if (event.type === 'tool/result') return true
+            if (event.type !== 'assistant/message') return false
+            const content = (event.data as { message?: { content?: readonly { type?: unknown }[] } }).message?.content
+            return Array.isArray(content) && content.some((blockItem) => blockItem.type === 'tool-call')
+          }).length
+          pointerTail = '\n' + mechanicalSpanLine(start, end, spanSeqs.length, shadowedTokens, toolCount)
+        }
+        summaryText = (coverageMatch !== null ? coverageMatch[1]! + pointerBody : pointerBody) + pointerTail
+        dedupPointerBlocks += 1
+        dedupSavedTokens += defaultCountTokens(withSummaryFramePrefix(groupNotes.get(group) ?? range.summary))
+      }
+    }
     const { compactionId } = runCompactionTransaction(session, {
       start,
       end,
       shadowedSeqs: shadowed,
-      summary: [{ type: 'text', text: range.summary }],
+      summary: [{ type: 'text', text: summaryText }],
       shadowedTokenCount: shadowedTokens,
       provider,
       model,
@@ -864,6 +1110,16 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       // B3：已绿验收读数随压缩块落盘（缺位=不写键）
       ...(range.verifiedReadings === undefined ? {} : { verifiedReadings: range.verifiedReadings }),
     })
+    // Batch note dedup bookkeeping AFTER the durable write: the landed
+    // compactionId is the pointer target later members reference.
+    if (range.noteGroup !== undefined) {
+      const group = range.noteGroup.group
+      if (groupFirstCompactionId.get(group) === undefined) {
+        groupFirstCompactionId.set(group, compactionId)
+        groupNotes.set(group, stripSummaryFrame(summaryText))
+      }
+      groupLandedCount.set(group, (groupLandedCount.get(group) ?? 0) + 1)
+    }
     const adjusted = start !== range.startSeq || end !== range.endSeq
     // Always report the tier, even tier 1: a silently-downgraded distill
     // (boundary moved off the checkpoint seq → the kernel folds a plain
@@ -899,6 +1155,15 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
     ? ''
     : ` from ${splitRangeCount} range${splitRangeCount === 1 ? '' : 's'} (split around ${splitProtectedRows} protected line${splitProtectedRows === 1 ? '' : 's'})`
   const summaryLine = `Compressed ${applied.result.blocksCreated} block(s)${splitLine}, ~${applied.result.tokensCompressed} tokens reclaimed.`
+  // Batch note dedup (B 方案) report line: what the dedup saved, so a live
+  // verification can reconcile the resident-token account against the block
+  // ledger. One line per pointer block (they are the exceptions a later reader
+  // must be able to find), plus the total.
+  let dedupLine = ''
+  if (dedupPointerBlocks > 0) {
+    dedupLine = `  note dedup: full note in block ${([...groupFirstCompactionId.values()].find((id) => id !== undefined) ?? '').slice(0, 8)}`
+      + `, ${dedupPointerBlocks} pointer block(s) reference it instead of storing the note (~${dedupSavedTokens} tokens saved resident); recall({ blockId }) on the 8-char id in the line above reads the full note.`
+  }
   // Models routinely reconstruct their own history wrongly AFTER a fold: the
   // compress call is itself shadowed into the block it created, so next turn the
   // only trace left on the visible surface is this result text. Measured
@@ -934,13 +1199,18 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
             const lastSpan = condensePick.spans[condensePick.spans.length - 1]!
             // The batch is priced from its EARLIEST rewrite point: everything after
             // the first span's start is re-prefilled once, and that includes every
-            // later range of the same prefix fold.
-            const firstIndex = indexOfSurfaceSeq(session, firstSpan.start)
-            const foldCost = firstIndex < 0 ? 0 : (surfaceSuffixTokens(session)[firstIndex] ?? 0)
+            // later range of the same prefix fold. The price was computed on the
+            // PRE-fold surface at election time (condense-elect: suffix after the
+            // last span's end) — re-computing it here AFTER the fold landed reads
+            // -1 for the now-shadowed first span and reported `~0t` on live tier-2
+            // batches (a live tier-2 batch showed `one re-prefill of ~0t`). The pick value is
+            // the pre-fold suffix, which IS the bill the next request pays.
+            const foldCost = condensePick.foldCostTokens
             // TIER 2 must never fold silently: distilling carriers replaces the originals
-            // behind them with ONE summary, and those originals stop being readable at
-            // message level (recall can still read the summary, not the bytes). Say that in
-            // the result line, where the model reads what just happened.
+            // behind them with ONE summary — the originals leave the VISIBLE surface,
+            // but stay recall-readable (the log keeps the bytes; recall pages the full
+            // original messages of a distilled block — live-verified on a tier-3 block).
+            // Say that in the result line, where the model reads what just happened.
             if (condensePick.kind === 'distill') {
               // M-3: the distill shape can arrive as a MULTI-span batch, so the landing
               // ref is whichever span actually ends on a carrier — the LAST span may be
@@ -948,8 +1218,7 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
               const lands = condensePick.spans
                 .map((span) => span.endBlock)
                 .find((block) => block !== null) ?? 'b?'
-              const foldCost = firstIndex < 0 ? 0 : (surfaceSuffixTokens(session)[firstIndex] ?? 0)
-              return `  distilled ${condensePick.distilledBlocks} blocks into 1 across seqs ${firstSpan.start}..${lands} (tier 2 \u2014 the originals behind those carriers are no longer recoverable at message level; recall reads the new summary, not the bytes), one re-prefill of ~${foldCost}t; the same call also folded ~${condensePick.tokens}t of gap prose that was under the ~${MIN_CONDENSE_SPAN_TOKENS}t a normal fold needs.`
+              return `  distilled ${condensePick.distilledBlocks} blocks into 1 across seqs ${firstSpan.start}..${lands} (tier 2 — the originals left the visible surface but stay recall-readable: recall({ blockId: "${lands}" }) still pages the full original messages, the log keeps the bytes), one re-prefill of ~${foldCost}t; the same call also folded ~${condensePick.tokens}t of gap prose that was under the ~${MIN_CONDENSE_SPAN_TOKENS}t a normal fold needs.`
             }
             const digest = condensePick.carrierCount > 0
               ? `, distilling ${condensePick.carrierCount} block(s)`
@@ -985,17 +1254,14 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       const widest = useful.reduce((max, range) => (range.tokens > max.tokens ? range : max), useful[0]!)
       return `  Still foldable: ${useful.length} range(s) remain — the widest is seqs ${widest.start}..${widest.end} (~${widest.tokens} tokens), held back by the working-set floor for now; the next nudge re-prices them against a shorter surface.`
     }
-    const firstSpan = next.spans[0]!
-    const lastSpan = next.spans[next.spans.length - 1]!
     const digest = next.carrierCount > 0 ? `, distilling ${next.carrierCount} block(s)` : ''
-    // Multi-span batches are POSITION-ordered, so lastSpan.end can be numerically
+    // Multi-span batches are POSITION-ordered, so the FIRST span's start can be numerically
     // SMALLER than firstSpan.start (the last run carries a checkpoint with a high
     // seq). Printing the raw numbers reads as a reversed/invalid range (live
-    // 2026-11-26: "seqs 2441..2423" after a tier-2 batch). When the value order
-    // disagrees with the position order, print each span separately and say so.
-    const prefixDesc = firstSpan.start <= lastSpan.end
-      ? `seqs ${firstSpan.start}..${lastSpan.end}`
-      : `${next.spans.length} span(s) in position order (checkpoint seqs sit high): ${next.spans.map((s) => `${s.start}..${s.end}`).join(', ')}`
+    // 2026-11-26: "seqs 2441..2423" after a tier-2 batch; problem 4 regression is
+    // pinned by tests on describePrefixSpans). When the value order disagrees with
+    // the position order, print each span separately and say so.
+    const prefixDesc = describePrefixSpans(next.spans)
     return `  Still foldable: ${next.eligibleRangeCount} range(s) remain — the foldable prefix is ${prefixDesc} (~${next.tokens} tokens${digest}). Fold it in a LATER turn: each call pays its own re-prefill and leaves its own barrier, so stacking folds inside one turn is the expensive way.`
   })()
   const totalSkipped = skippedRanges + alreadyCompressedNotes.length + duplicateRangeNotes.length + rejectedNotes.length
@@ -1010,12 +1276,18 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
       ]
   const warningLines = [
     ...condenseAdvisories,
-    // The shared-note cost, stated instead of hidden: nothing was lost, but a note
-    // written for the whole span is resident once per cut block, so the model knows
-    // why a split costs more than the block sizes suggest.
+    // 蒸馏产物截断预算的 advisory（截断/拒绝项），位于批信息之前。
+    ...distillBudgetNotes,
+    // The shared-note cost, stated instead of hidden — DEDUP-AWARE. When the batch
+    // note dedup ran (dedupPointerBlocks > 0) only the FIRST block stores the full
+    // note and the rest carry a pointer line, so the older "whole note once per
+    // block" wording would promise a full note in every cut block that is not
+    // there. The two wordings must never disagree with what landed.
     ...(splitBlocks === 0
       ? []
-      : [`  ${splitBlocks} block(s) came from ${splitRangeCount} range(s) cut around ${splitProtectedRows} protected line(s): each cut block carries the model's WHOLE-SPAN note plus its own [split i/N …] coverage line, so the note is resident once per block (~${splitExtraTokens} extra tokens in total) — nothing was lost, and no bytes moved between blocks.`]),
+      : [dedupPointerBlocks > 0
+          ? `  ${splitBlocks} block(s) came from ${splitRangeCount} range(s) cut around ${splitProtectedRows} protected line(s): the FIRST block stores the model's WHOLE-SPAN note and each later block carries its own [split i/N …] coverage line plus a pointer to that block (${dedupPointerBlocks} pointer block(s), ~${dedupSavedTokens} tokens saved resident) — nothing was lost, and no bytes moved between blocks.`
+          : `  ${splitBlocks} block(s) came from ${splitRangeCount} range(s) cut around ${splitProtectedRows} protected line(s): each cut block carries the model's WHOLE-SPAN note plus its own [split i/N …] coverage line, so the note is resident once per block (~${splitExtraTokens} extra tokens in total) — nothing was lost, and no bytes moved between blocks.`]),
     ...freeWarnings.map((warning) => `  ${warning}`),
     ...failedLines,
     ...alreadyCompressedNotes,
@@ -1027,5 +1299,5 @@ export async function handleCompress(env: ToolEnvironment, args: CompressArgs, e
   const footer = totalSkipped > 0
     ? `  (${totalSkipped} range(s) skipped or failed — see above)`
     : ''
-  return { text: `${summaryLine}\n${[actionLine, ...warningLines, condenseLine, nextFoldLine, footer].filter((line) => line !== '').join('\n')}` }
+  return { text: `${summaryLine}\n${[actionLine, ...warningLines, condenseLine, nextFoldLine, dedupLine, footer].filter((line) => line !== '').join('\n')}` }
 }

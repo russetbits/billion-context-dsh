@@ -66,10 +66,14 @@ export interface FoldPlan {
     readonly reclaimTokens: number;
     /** 一次性成本 = 折后**保留下来的**那部分要重读多少（不是折掉的部分）。 */
     readonly foldCostTokens: number;
-    readonly breakEvenRequests: number;
+    /** `foldCostTokens / reclaimTokens` — a REQUEST count, reported for display
+     *  (M-3: payback is no longer a gate; the capacity gate is the only one). */
+    readonly paybackRequests: number;
 }
-/** 手写摘要的常驻成本（真机 condense 实测中位 ~915t），用来算保留下来的体积。 */
-export declare const TYPICAL_NOTE_TOKENS = 900;
+/** 手写摘要的常驻成本。2026-11-25 随 doctrine 收紧为 Appendix-A 四件套简报，
+ *  从真机实测分布（s2115 n=56 / s5e5c n=33，p50 ~480t）重定为 400，
+ *  与 src/tools.ts 的 TYPICAL_HANDOFF_NOTE_TOKENS 保持同一依据。 */
+export declare const TYPICAL_NOTE_TOKENS = 400;
 /**
  * A-9 / M-1（2026-11-23~24）：批量折叠计划。
  *
@@ -88,7 +92,7 @@ export declare const TYPICAL_NOTE_TOKENS = 900;
  * 候选必须来自**全部**可压段（调用方不要先 slice），否则最优下界可能落在被
  * 截掉的后半段里 —— 真机上最老 6 段恰好最碎、fold 价最高。
  */
-export declare function foldPlanOf(ranges: readonly SeqCompressibleRange[], notesTokens?: number): FoldPlan | null;
+export declare function foldPlanOf(ranges: readonly SeqCompressibleRange[], notesTokens?: number, pricing?: FoldPricing): FoldPlan | null;
 /**
  * Lazy per-seq media price. The FIRST lookup triggers one meter measurement, so
  * the range walk only asks about seqs that really carry an attachment — a
@@ -97,15 +101,6 @@ export declare function foldPlanOf(ranges: readonly SeqCompressibleRange[], note
  * same vocabulary as the nudge table.
  */
 export declare function meterMediaPriceResolver(agent: Agent, session: import('@deepseek-ai/dsh-session').Session): MediaPriceOf;
-/**
- * Render the compressible-range table as seq refs for the model.
- *
- * The spans are the kernel's own (`compressibleRanges`, translated to surface
- * seqs) with the host guards applied on top — see buildCompressibleSeqRanges.
- * This function used to self-compute them from the surface as a labeled
- * `UPSTREAM:` workaround for kernel ref-map drift; that drift is fixed upstream
- * (acp-kernel #207) and the workaround is gone (rule 11).
- */
 export declare function rangeTable(session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf, foldPricing?: FoldPricing): string;
 /**
  * Compute a SURFACE-ONLY context breakdown for display, aligned with

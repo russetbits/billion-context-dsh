@@ -162,7 +162,14 @@ export interface CompressArgs {
   content?: Array<{ startSeq: number | string; endSeq: number | string; summary: string; topic?: string; verifiedReadings?: string[] }>
   /** Engine-picked fold: the engine names the span, the model writes the handoff note. */
   force?: boolean
-  condense?: { summary: string; topic?: string; verifiedReadings?: string[]; force?: boolean }
+  condense?: {
+    summary: string
+    topic?: string
+    verifiedReadings?: string[]
+    force?: boolean
+    /** 段级 note：批内每段一行模型小结（主路径）；缺位时指针块落机械描述行兜底。 */
+    spans?: Array<{ startSeq: number | string; endSeq: number | string; note: string }>
+  }
 }
 
 /**
@@ -339,6 +346,31 @@ export const compressParameters = {
       topic: { type: 'string' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.topic'] },
       force: { type: 'boolean' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.force'] },
       verifiedReadings: { type: 'array' as const, items: { type: 'string' as const }, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.verifiedReadings'] },
+      spans: {
+        type: 'array' as const,
+        items: {
+          type: 'object' as const,
+          properties: {
+            startSeq: {
+              required: true,
+              oneOf: [
+                { type: 'integer' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.spans.startSeq'] },
+                { type: 'string' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.spans.startSeq'] },
+              ],
+            },
+            endSeq: {
+              required: true,
+              oneOf: [
+                { type: 'integer' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.spans.endSeq'] },
+                { type: 'string' as const, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.spans.endSeq'] },
+              ],
+            },
+            note: { type: 'string' as const, required: true, description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.spans.note'] },
+          },
+          additionalProperties: false as const,
+        },
+        description: DEFAULT_TOOL_PARAM_TEXTS['compress.condense.spans'],
+      },
     },
     additionalProperties: false,
   },
