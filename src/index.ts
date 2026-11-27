@@ -61,6 +61,7 @@ import {
   type KernelRangeView,
 } from './region.ts'
 import { allLogMessages, eventsToCoreMessages, extractEventText, overflowMarkerSummary, surfaceEventsOf, toolCallIdOfResultEvent } from './messages.ts'
+import { truncateToolResults } from './tool-result-truncate.ts'
 import {
   detectPtcMode,
   looksLikeLeakedAcpCall,
@@ -336,6 +337,16 @@ export interface AcpConfig {
    */
   readonly maxOverflowRetries?: number
   /**
+   * Per-result text budget (Unicode code points) for the tool-result middle
+   * truncation pass (src/tool-result-truncate.ts), which runs at
+   * `agent/pre-step` and borrows the HOST's own `ToolResultPruner` algorithm —
+   * head 4096 + marker + tail 1024, byte-identical marker and slicing. New
+   * over-budget `tool/result` nodes are truncated 1:1 (spilled rows skipped,
+   * media blocks untouched); a default of 8192 keeps the host parity budget.
+   * `0` disables the pass entirely.
+   */
+  readonly toolResultPruneChars?: number
+  /**
    * No-action degrade fold (方案 D layer 2): how many consecutive user turns a
    * session may sit at or above the emergency nudge threshold
    * (nudgeEmergencyThresholdPct, engine default 0.85) without a single
@@ -416,6 +427,10 @@ const DEFAULT_CONFIG: AcpConfig = {
   // a successful compress the engine folds the largest eligible span itself
   // (once per session, EMERGENCY PROVENANCE stamped, no overflow retry spent).
   emergencyFoldAfterTurns: 3,
+  // Tool-result middle truncation: 8192 code points — the host's own default
+  // budget, so a truncated result is byte-identical to what compaction-basic
+  // would have pruned. 0 disables.
+  toolResultPruneChars: 8192,
 }
 
 export function resolveAcpConfig(config: Partial<AcpConfig> = {}): AcpConfig {
@@ -429,7 +444,21 @@ export function resolveAcpConfig(config: Partial<AcpConfig> = {}): AcpConfig {
   // in a Partial config survives the `{ ...DEFAULT_CONFIG, ...config }` spread
   // as `undefined`, and the request-error listener must never read that as
   // "budget 0" (recovery silently disabled while the config says default).
-  return { ...resolved, maxOverflowRetries, emergencyFoldAfterTurns: normalizeEmergencyFoldAfterTurns(resolved.emergencyFoldAfterTurns) }
+  return { ...resolved, maxOverflowRetries, emergencyFoldAfterTurns: normalizeEmergencyFoldAfterTurns(resolved.emergencyFoldAfterTurns), toolResultPruneChars: normalizeToolResultPruneChars(resolved.toolResultPruneChars) }
+}
+
+/**
+ * Normalize the tool-result truncation knob: an explicit `undefined` in a
+ * Partial config survives the DEFAULT_CONFIG spread and must read as the
+ * engine default (8192), while `0` means the operator explicitly disabled the
+ * pass — never a missing key.
+ */
+function normalizeToolResultPruneChars(value: number | undefined): number {
+  if (value === undefined) return 8192
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`toolResultPruneChars must be a non-negative integer (got ${value})`)
+  }
+  return value
 }
 
 /**
@@ -604,6 +633,8 @@ export class AcpCompactionEngine extends CompactionEngine {
   private realmCompactionHandled = false
 
   private readonly lastNudgeTurn = new LruMap<string, NudgeGate>(DEFAULT_SESSION_CACHE_LIMIT)
+  /** Per-session set of surface seqs already truncated by the tool-result middle-truncation pass (src/tool-result-truncate.ts) — a replaced node must never be re-truncated. */
+  private readonly truncatedToolResults = new LruMap<string, Set<number>>(DEFAULT_SESSION_CACHE_LIMIT)
   /** Per-session emergency-nudge injection budget for the current user turn (issue #108). */
   private readonly emergencyNudges = new Map<string, { turn: number; count: number }>()
   /** Successful compress call ids awaiting their tool/result so the pair can be hidden. */
@@ -1099,6 +1130,26 @@ export class AcpCompactionEngine extends CompactionEngine {
         this.disableBasicOnce()
         pruneStaleNudgeRows(payload.agent.session)
         stripOrphanedSurfaceToolMessages(payload.agent.session)
+        // Tool-result middle truncation (src/tool-result-truncate.ts): the
+        // host pruner algorithm is borrowed verbatim; only NEW over-budget
+        // tool results are truncated 1:1 (per-session processed set dedups,
+        // spilled rows skipped). Runs before calibration/nudge so every later
+        // pressure reading sees the smaller surface. 0 disables.
+        const truncateChars = this.config.toolResultPruneChars ?? 8192
+        if (truncateChars > 0) {
+          const sessionKey = payload.agent.session.id
+          let processed = this.truncatedToolResults.get(sessionKey)
+          if (processed === undefined) {
+            processed = new Set<number>()
+            this.truncatedToolResults.set(sessionKey, processed)
+          }
+          const truncation = truncateToolResults(payload.agent.session, processed, truncateChars)
+          if (truncation.pruned.length > 0) {
+            ctx.logger.warn(
+              `billion-context-dsh: truncated ${truncation.pruned.length} tool result(s) on session ${sessionKey} (${truncation.charsRemoved} chars removed)`,
+            )
+          }
+        }
         // Calibration pair for the emergency fit check (src/usage.ts): the newest billed
         // request against the surface of the step that PRODUCED it. Pairing it with THIS
         // step's surface would compare two moments — the surface already carries the

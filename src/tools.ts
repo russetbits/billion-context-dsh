@@ -97,13 +97,11 @@ export { compressParametersFor, recallParametersFor, statusParametersFor } from 
  *
  * The four MAIN tools are `textOverrides`-addressable today: `compress`/`recall`/
  * `acp_status` through `prompts.tools.*` and the compress sheet's `condense`
- * parameter through `compressesParametersFor` above. TODO(textOverrides): the
- * remaining ~26 parameter `description` strings (compress content items, force,
+ * parameter through `compressParametersFor` above. All remaining parameter
+ * `description` strings are `textOverrides`-addressable too, via the
+ * `*_PARAM_PATCHES` tables in `src/params.ts` (compress content items, force,
  * verifiedReadings, recall's query/blockId/seq/chars/maxResults/offset/pageLimit,
- * acp_status's detail/tool/sort/limit) are still hard-coded — wiring them means
- * turning `compressParameters`/`recallParameters`/`statusParameters` into
- * prompt-derived builders, which collides with the in-flight content-path work in
- * this file; left as a deliberate follow-up rather than a half-migration.
+ * acp_status's detail/tool/sort/limit).
  */
 export function makeTools(env: ToolEnvironment): ToolDefinition[] {
   const prompts = env.prompts ?? DEFAULT_RESOLVED

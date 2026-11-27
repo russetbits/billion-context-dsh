@@ -194,10 +194,10 @@ export async function handleStatus(env: ToolEnvironment, rawArgs: StatusArgs, ex
       lines.push('', `Fold barriers: ${folds} (each splits the surface and can never be folded again) — fewer, larger folds preserve room for later folds`)
       if (folds >= 2) {
         // The fragmentation failure mode, stated where the model looks BEFORE calling: a
-        // surface of many sub-minimum gaps has no plain fold left, and the only move that
-        // still works is folding ACROSS the carriers (tier 2 — originals behind them are
-        // gone). Kept on its own line so it is never read as a range row.
-        lines.push(`  obstacle: when every foldable gap is under the ${MIN_CONDENSE_SPAN_TOKENS}t a normal fold needs (the nudge table prints each row's size), folding ACROSS the carriers is the only way forward — compress({ condense: { summary } }) does it in ONE transaction, and its result names the tier-2 loss (the originals behind those carriers stop being recoverable at message level).`)
+        // surface of many sub-minimum gaps has no plain fold left, and the only move
+        // that still works is an EXPLICIT tier-2 distill — a plain condense refuses to
+        // fold across carriers. Kept on its own line so it is never read as a range row.
+        lines.push(`  obstacle: when every foldable gap is under the ${MIN_CONDENSE_SPAN_TOKENS}t a normal fold needs (the nudge table prints each row's size), distill the carriers explicitly instead — compress({ content: [{ startSeq: 'b1', endSeq: 'bN', summary }] }) over the carrier seqs acp_status's Checkpoint seqs row shows; the block-id boundaries are the tier-2 distill path, and the originals behind those carriers stay recall-readable (recall({ blockId }) pages them back).`)
       }
     }
     if (contextLimit > 0 && live > 0) sizeParts.push(`window ${contextLimit}`, `room ${Math.max(0, contextLimit - live)}`)

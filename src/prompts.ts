@@ -222,7 +222,7 @@ export const DEFAULT_TOOL_PARAM_TEXTS: Readonly<Record<string, string>> = {
   'compress.startSeq.text': "Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref (\"m00306\") or a kernel block id (\"b1\", as acp_status lists) is also accepted — a block id resolves to that block's checkpoint seq, which makes the fold a tier 2/3 distillation.",
   'compress.endSeq': "Inclusive last surface seq of the range.",
   'compress.endSeq.text': "Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id (\"b3\") — for a multi-block condense name the LAST block id (tier 3).",
-  'compress.summary': "Complete technical summary replacing the range; keep paths, decisions, values verbatim. Minimum 50 characters.",
+  'compress.summary': "Complete technical summary replacing the range; keep paths, decisions, values verbatim. Non-empty is all the gate asks — the note-weight cap and the Task/Now skeleton are the real constraints.",
   'compress.item.topic': "Short label (3-5 words) for this range.",
   'compress.verifiedReadings': "The moment a verification comes back green AND a later step will depend on that result, pass the readings here (e.g. \"closedloop 414/414\", \"t4-write-epoch 6/6\"). They are stored structurally on the block and shown by acp_status and recall({blockId}), so a resumed session does not re-run the suite. Do not pass readings you have not actually run.",
   'compress.force': "Override the working-set floor guard on BOTH paths — an explicit content range whose fold leaves less than foldFloorPct of the window visible, and a condense election. Legitimate only for imminent overflow: a shallow working set is where open-weight accuracy collapses (arXiv 2611.05306 Appendix D).",
@@ -262,7 +262,7 @@ export const DEFAULT_PROMPTS: ResolvedPrompts = {
     tier: 'Tier {tier}: {count} tier-{prevTier} block(s) distillable ({tokens} tokens) — distill them by compressing their checkpoint seq(s) [seqs {seqs}] as one range: compress({ content: [{ startSeq: {firstSeq}, endSeq: {lastSeq}, summary }] }).',
     breakdown: 'Context breakdown: {system}K system | {tool}K tool | {summaries}K summaries | {code}K code | {text}K text',
     growth: '+{growth}K since last nudge',
-    tip: '💡 One call is enough: compress({ condense: { summary } }) lets the engine pick the span (folds the OLDEST consumed PREFIX, every fold barrier inside it merges into ONE block), and compress({ content: [{ startSeq, endSeq, summary }, …] }) batches explicit ranges — content must be an ARRAY (a plain-string content is rejected).',
+    tip: '💡 One call is enough: compress({ condense: { summary } }) lets the engine pick the span (folds the OLDEST consumed PREFIX — one block per span: the first carries the full note, later blocks carry a pointer), and compress({ content: [{ startSeq, endSeq, summary }, …] }) batches explicit ranges — content must be an ARRAY (a plain-string content is rejected).',
     cacheCost: 'Since last compress: +{uncached} uncached input tokens billed ({count} compress(es) so far) — a replace re-prefills everything the prompt carries AFTER the rewrite point ONCE, so fold rarely, in bulk, and no earlier than the consumed span forces.',
   },
   rangeTable: {
@@ -270,13 +270,13 @@ export const DEFAULT_PROMPTS: ResolvedPrompts = {
     title: 'Ranges ({count}, cheapest rewrite point first — condense always folds the OLDEST eligible prefix, so write your note for that stretch):',
     line: '  - seq {start}..{end} \u00b7 {count}msg ~{tokens}t tool{toolPct}%{media} \u00b7 fold ~{foldCost} \u00b7 payback {payback}{tools}',
     plan: 'Best batch here: {rows} row(s) in ONE call → ~{reclaim}t less on every later request, one re-prefill of ~{fold}t — pays back in {payback} req. The fold column prices each row ALONE; the batch pays one re-prefill for all of them.',
-    footer: 'fold = re-prefilling every token AFTER the rewrite point, paid ONCE; batch rows into ONE call. DEFAULT MOVE: compress({ condense: { summary } }) — the engine folds the oldest eligible prefix and merges every barrier inside it into ONE block, so you never hand-assemble boundaries.\nUse compress({ content: [{ startSeq, endSeq, summary }] }) only for an exact span or several disjoint ones; stale seqs mean re-run acp_status. A row marked N spilled has its bytes on a FILE — folding it loses nothing; a row marked below floor strands the working set — fold a row that STILL LEAVES the floor. Only fold spans you have fully consumed: carry their open TODOs and artifact paths into the summary, or leave them live.',
+    footer: 'fold = re-prefilling every token AFTER the rewrite point, paid ONCE; batch rows into ONE call. DEFAULT MOVE: compress({ condense: { summary } }) — the engine folds the oldest eligible prefix (one block per span — the first carries the full note, later blocks carry a pointer), so you never hand-assemble boundaries.\nUse compress({ content: [{ startSeq, endSeq, summary }] }) only for an exact span or several disjoint ones; stale seqs mean re-run acp_status. A row marked N spilled has its bytes on a FILE — folding it loses nothing; a row marked below floor strands the working set — fold a row that STILL LEAVES the floor. Only fold spans you have fully consumed: carry their open TODOs and artifact paths into the summary, or leave them live.',
   },
   tools: {
     compress: 'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference.\n'
       + 'display: condense (DEFAULT \u2014 engine elects the cheapest eligible shape, possibly a multi-span batch, you name no boundary) | content (EXPLICIT \u2014 you name the spans)\n'
-      + 'condense: compress({ condense: { summary } }) folds the cheapest eligible shape of the CURRENT surface (possibly a multi-span batch across walls) in ONE replace; the note is a brief for the work AHEAD (NVIDIA App. A four-field shape, 150-400 tokens — not a narrative of what happened):\n'
-      + '  ## Task (verbatim/near-verbatim copy of the task this stretch served — REQUIRED) ## Now (current work + intent + next step, done when <criterion> — REQUIRED) ## Plan (decomposition + completion criteria) ## Pointers (artifact paths/seq/blockId — keep credentials and exact values verbatim)\n'
+      + 'condense: compress({ condense: { summary } }) folds the cheapest eligible shape of the CURRENT surface (possibly a multi-span batch across walls) in ONE replace; the note is a brief for the work AHEAD (Appendix A shape — Task/Now hard-checked, Plan/Pointers/Verification/Dead ends advisory; 150-400 tokens — not a narrative of what happened):\n'
+      + '  ## Task (verbatim/near-verbatim copy of the task this stretch served — required in practice: the fold still lands without them, but a note without them turns one fold into a re-run of the work it replaced) ## Now (current work + intent + next step, done when <criterion> — same required-in-practice) ## Plan (decomposition + completion criteria) ## Pointers (artifact paths/seq/blockId — keep credentials and exact values verbatim)\n'
       + '  judgment: fold what is consumed, keep what is still in use; never summarize narrative process\n'
       + '  multi-span batch: pass spans:[{startSeq,endSeq,note},…] — one short per-span note so each pointer block keeps its segment detail (≤600 chars each; skipped spans get a mechanical metadata line)\n'
       + 'content: compress({ content: [{ startSeq, endSeq, summary, topic?, verifiedReadings? }] }) \u2014 batch disjoint ranges in ONE call (each entry its own block; one re-prefill for the batch); boundaries = surface seqs (acp_status or nudge table), bN, or mN\n'
@@ -294,8 +294,12 @@ export const DEFAULT_PROMPTS: ResolvedPrompts = {
       + 'READ: recall({ blockId: "b1" }) dumps a block\'s original messages read-only (the bN ref acp_status lists, or a compaction id / prefix from a search hit; large blocks page — pass offset/pageLimit and follow the continue hint, and locate the page you need with a query first), and recall({ seq: 42 }) returns ONE event\'s original text (pass chars to read past the 20000-char cut; works after a fold because the log keeps the bytes). '
       + 'One call is one form: query + blockId/seq in the same call is refused. Examples: recall({ query: "AUTH_TOKEN_TTL" }) · recall({ blockId: "b1", offset: 0, pageLimit: 50 }).',
     acpStatus: 'Context status: overview of the current context — CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) work in BOTH tools — recall({ blockId: "bN" }) reads the block, and compress accepts bN as a boundary to DISTILL that block (tier 2/3); plain spans use the Surface: seq range. Drilldown: detail:"compressed" for the per-block list, detail:"visible" for the merged foldable ranges, detail:"messages" for every visible message; no detail = overview. tool narrows to one tool name (detail:"messages" only), sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) — feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN also works as a compress boundary (it distills that block), Surface: seqs cover plain spans.',
-    condense: 'Engine-picked fold: from EVERY foldable shape of the CURRENT surface (prefix, a cut inside the prefix\'s first range, a single range, a multi-span batch that folds every wall-free run in ONE rewrite) the engine elects the cheapest eligible shape (possibly a multi-span batch) whose folded span reaches the note-carrying minimum and whose remainder stays above the working-set floor (walls it may never cross: the newest injected instruction copy of every scope, the newest skill catalog, the active user turn) — and folds it in ONE durable replace — you write the handoff note, and the result names the spans it actually folded. Mutually exclusive with content. The note is a BRIEF FOR THE WORK AHEAD, not a narrative of what happened (NVIDIA App. A): "## Task" (verbatim/near-verbatim copy of the task) and "## Now" (current work + intent + next step) are required, "## Plan" (decomposition + completion criteria) and "## Pointers" (artifact paths, credentials/values verbatim) are the advisory rest — and keep it SHORT, 150-400 tokens: the note stays resident in every later request. A note without the required fields turns one fold into a re-run of the work it replaced. Price: the next request re-prefills every token AFTER the rewrite point ONCE, so the rewrite point IS the lever — a fold near the tail barely re-reads anything, one near the head re-reads almost everything. Prefer the LATEST consumed stretch, fold in bulk, and do not fold at all when nothing consumed is worth reclaiming.'
-      + ' In a multi-span batch pass `spans: [{startSeq, endSeq, note}, …]` — one short per-span note so each pointer block keeps its segment detail; spans you skip fall back to a mechanical metadata line on their pointer block.',
+    condense: 'Engine-picked fold: from EVERY foldable shape of the CURRENT surface (prefix, a cut inside the prefix\'s first range, a single range, a multi-span batch that folds every wall-free run in ONE rewrite) the engine elects the cheapest eligible shape (possibly a multi-span batch) whose folded span reaches the note-carrying minimum and whose remainder stays above the working-set floor (walls it may never cross: the newest injected instruction copy of every scope, the newest skill catalog, the active user turn) — and folds it in ONE durable replace — you write the handoff note, and the result names the spans it actually folded. Mutually exclusive with content. The note is a BRIEF FOR THE WORK AHEAD, not a narrative of what happened (Appendix A — Task/Now hard-checked, Plan/Pointers/Verification/Dead ends advisory): "## Task" (verbatim/near-verbatim copy of the task) and "## Now" (current work + intent + next step) are the load-bearing pair, "## Plan" (decomposition + completion criteria) and "## Pointers" (artifact paths, credentials/values verbatim) are the advisory rest — and keep it SHORT, 150-400 tokens: the note stays resident in every later request. A note without Task/Now turns one fold into a re-run of the work it replaced. Price: the next request re-prefills every token AFTER the rewrite point ONCE, so the rewrite point IS the lever — a fold near the tail barely re-reads anything, one near the head re-reads almost everything. Prefer the LATEST consumed stretch, fold in bulk, and do not fold at all when nothing consumed is worth reclaiming.'
+      + ' In a multi-span batch pass `spans: [{startSeq, endSeq, note}, …]` — one short per-span note so each pointer block keeps its segment detail; spans you skip fall back to a mechanical metadata line on their pointer block.\n'
+      + 'self-check: after writing, reread the note as if you had amnesia and only this note — could the next step continue seamlessly? Fill any gap before submitting (one round-trip beats a post-hoc recall).\n'
+      + 'reader: the note is read by POST-COMPRESSION you — zero prior memory, only this note; write Task/Now so that reader can act, not as a reminder to yourself.\n'
+      + 'timing: fold at a phase close (conclusion settled, artifacts on disk, TODOs explicit). Folding mid-work is sometimes forced (window pressure) — then DUMP unfinished work to workspace files FIRST and put the file pointers in the note (what the file covers, what is still missing); an un-settled span read cold yields the worst notes.\n'
+      + 'facts vs inference: the note is carried forward by later distills as FACT — mark uncertain items unverified; errors amplify through distillation and get costlier to correct each tier.',
   },
   toolParamTexts: DEFAULT_TOOL_PARAM_TEXTS,
   systemPromptTemplate: `Active Context Pruning — model-driven context management
@@ -322,21 +326,33 @@ WHEN NOT TO COMPRESS:
 {howToCompressRules}
 
 CONDENSE — an engine-elected fold, for a long context with many turns still ahead:
-compress({ condense: { summary } }) elects the LARGEST eligible continuous run of the
-CURRENT surface and folds it in ONE replace — you do not name the span, you write the
+compress({ condense: { summary } }) elects the CHEAPEST eligible shape of the CURRENT
+surface — a predictable oldest prefix first, then the least re-prefill (the widest
+run is exactly the one the floor refuses) — and folds it in ONE replace — you do not
+name the span, you write the
 note. Walls the election never crosses: the newest injected instruction copy of every
 scope, the newest skill catalog, checkpoint carriers, the system node, the active user
 turn (superseded injection copies DO fold — they cannot come back). The judgment call
 is ONE line: fold what is consumed, keep what is still in use — content the current
 step is reading or reasoning about stays live no matter how big it is.
-The note is a BRIEF FOR THE WORK AHEAD (Appendix A four-field shape), NOT a narrative
+The note is a BRIEF FOR THE WORK AHEAD (Appendix A shape — Task/Now hard-checked,
+Plan/Pointers/Verification/Dead ends advisory), NOT a narrative
 of what happened — no stage-by-stage retelling. Keep it SHORT: 150-400 tokens; it
 stays resident in every later request.
-- ## Task (REQUIRED): verbatim or near-verbatim copy of the task this stretch served
-- ## Now (REQUIRED): current work + intent + the immediate next step, with its done-when
+- ## Task: verbatim or near-verbatim copy of the task this stretch served
+- ## Now: current work + intent + the immediate next step, with its done-when
 - ## Plan: the decomposition and each step's completion criterion (when is it DONE)
 - ## Pointers: artifact paths / seqs / blockIds, credentials and exact values verbatim
-A note without the required headings turns one fold into a re-run of the work it replaced.
+Task and Now are required in practice — the fold still lands without them, but a note
+without them turns one fold into a re-run of the work it replaced.
+Reread your note before submitting: amnesia test — with ONLY this note, could the next
+step continue seamlessly? Fill any gap first (one round-trip beats a post-hoc recall).
+Its reader is POST-COMPRESSION you — zero prior memory, only this note; write Task/Now
+for that reader, not as a memo to yourself. Fold at a phase close (conclusion settled,
+artifacts on disk, TODOs explicit); folding mid-work is sometimes forced by window
+pressure — then dump unfinished work to workspace files FIRST and point the note at
+them (what each file covers, what is missing). Mark uncertain items unverified: later
+distills carry the note forward as fact, and errors amplify through distillation.
 Price: the next request re-prefills every token AFTER the
 rewrite point ONCE, so WHERE the rewrite lands is the lever — a fold near the tail
 barely re-reads anything, one near the head re-reads almost everything, and three
