@@ -88,6 +88,12 @@ test('M5: context overflow emergency-compacts the largest eligible block and ret
   assert.match(block.summary, /context-overflow emergency compaction/, 'the marker summary names its origin')
   assert.ok(!block.summary.includes(SUMMARY_FRAME_PREFIX), 'engine-written marker is NOT stamped as a model-written summary')
   assert.ok(block.shadowedSeqs.length > 0, 'the block shadowed a non-empty range')
+  // The marker is the resumed model's ONLY description of a fold it did not make:
+  // it must state the action, the covered seq range, and the recall-first order.
+  assert.match(block.summary, /EMERGENCY fold written by the engine/, 'the marker says the engine wrote it, not the model')
+  assert.match(block.summary, new RegExp(`surface seqs ${block.start}\\.\\.${block.end}`), 'the marker names the covered seq range')
+  assert.match(block.summary, /recall\(\{ seq \}\)/, 'the marker points at the recall READ form')
+  assert.match(block.summary, /recall.*user instructions and current task state/, 'the marker orders recall BEFORE continuing')
   // What the MODEL sees must be the same bytes: the projection net frames every
   // checkpoint node, so the marker has to be recognized as engine-written on
   // that path too — otherwise the frame would mislabel it as model-written and

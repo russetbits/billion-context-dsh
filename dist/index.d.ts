@@ -5,8 +5,8 @@
  * The model decides when and what to compress (pure ACP semantics):
  *  - the `compress` tool durably shadows a surface range with the model-written
  *    summary (no second LLM summarization call — the ACP cost win);
- *  - the original events stay in the append-only session log, so `decompress`,
- *    `search_context`, and replay always work;
+ *  - the original events stay in the append-only session log, so `recall`
+ *    (its search form and its read form) and replay always work;
  *  - refs are surface seqs carried by the injected nudge's range table (DSH
  *    has no in-memory message rewrite hook — see docs/dsh-porting-verification.md);
  *  - automatic policy never summarizes by itself: it nudges the model.
@@ -31,7 +31,7 @@ import { type CompressionCore } from './kernel/index.ts';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { AcpStateStore } from './state.ts';
 import { type ToolEnvironment } from './tools.ts';
-import { type AcpPrompts, type ResolvedPrompts } from './prompts.ts';
+import { type AcpPrompts, type ResolvedPrompts, type TextOverrides } from './prompts.ts';
 import { type AcpWindow } from './window.ts';
 import { type ToolCallStyle } from './ptc.ts';
 import { type SettingsCommandSurface } from './settings.ts';
@@ -40,10 +40,10 @@ export { AcpStateStore } from './state.ts';
 export { kernelConfigFor, type KernelConfigInput } from './config.ts';
 export { PRESETS, PRESET_NAMES, isPresetName, resolvePreset, type NudgePreset, type PresetName, } from './presets.ts';
 export { ACP_SYSTEM_PROMPT, ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts';
-export { DEFAULT_PROMPTS, DEFAULT_RESOLVED, renderSystemPrompt, renderTemplate, resolvePrompts, type AcpPrompts, type NudgePrompts, type PromptInput, type PromptOverride, type RangeTablePrompts, type ResolvedPrompts, type ToolPrompts, } from './prompts.ts';
+export { DEFAULT_PROMPTS, DEFAULT_RESOLVED, applyTextOverrides, ableTextIds, renderSystemPrompt, renderTemplate, resolvePrompts, textById, textOverrideWarningLines, type TextOverrideReport, type TextOverrides, type AcpPrompts, type NudgePrompts, type PromptInput, type PromptOverride, type RangeTablePrompts, type ResolvedPrompts, type ToolPrompts, } from './prompts.ts';
 export { makeTools, type ToolEnvironment } from './tools.ts';
 export { acpCommand } from './commands.ts';
-export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type NudgeEnvironment, type NudgeOutcome } from './nudge.ts';
+export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type NudgeEnvironment, type NudgeGate, type NudgeOutcome } from './nudge.ts';
 export { DEFAULT_CONTEXT_WINDOW, detectContextWindow, projectedContextWindow, windowSourceLabel, type AcpWindow, } from './window.ts';
 export { AlreadyCompressedRangeError, rebuildBlockLedger, resolveSurfaceRange, runCompactionTransaction, shadowedSeqsOf, findOpenTurn, assertNoActiveCompaction, blockRegistry, blockRefForSummarySeq, compactionIdsOfKernelBlocks, summarySeqOfKernelBlock, expandShadowedSeqs, hideCompressToolPair, stripOrphanedSurfaceToolMessages, type AcpBlockLedgerEntry, type CompactionTransactionInput, type ResolvedSurfaceRange, } from './region.ts';
 export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText } from './messages.ts';
@@ -135,6 +135,16 @@ export interface AcpConfig {
     /** Per-stage prompt template overrides (nudge / range table / system prompt / tool descriptions). See docs/configurable-prompts-design.md. */
     readonly prompts?: AcpPrompts;
     /**
+     * Flat id-addressed FULL REPLACEMENT of any model-visible text (`nudge.*`,
+     * `rangeTable.*`, `tool.*`, `systemPrompt`); ids come from `ableTextIds()`.
+     * Unlisted ids keep the English default. Applied AFTER `prompts` and BEFORE
+     * the PTC rewrite, so an override still adapts to the active calling
+     * convention. Non-string or unknown ids are ignored with one warning line —
+     * a typo must never stop the plugin from starting. See src/config.ts for the
+     * token-cost caveat (translation makes the copy heavier, not cheaper).
+     */
+    readonly textOverrides?: TextOverrides;
+    /**
      * How the model reaches the ACP tools. `auto` (default) detects PTC / code mode
      * from the assembled system prompt of each session every step; `native` or
      * `ptc` pin it (an operator override, or a host whose PTC copy changes).
@@ -183,6 +193,12 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     readonly config: AcpConfig;
     /** Resolved prompt templates (validated at construction — fail-fast on template typos). */
     readonly prompts: ResolvedPrompts;
+    /**
+     * One-line diagnostics from `textOverrides` (unknown ids, oversized values).
+     * Empty when nothing was overridden. Logged once at construction and echoed by
+     * `acp_status`, because a composition-row config has no other visible surface.
+     */
+    readonly textOverrideLines: readonly string[];
     /** The prompt set ACTUALLY applied to the current step: `prompts` in native
      *  mode, its PTC variant in code mode (src/ptc.ts). `prompts` keeps the
      *  composition value so introspection and tests see what was configured. */
@@ -315,7 +331,7 @@ export declare class AcpCompactionEngine extends CompactionEngine {
      * engine-written marker summary. No LLM call — the provider just rejected
      * the request for being too large, so there is no model turn available to
      * write a summary; the originals stay in the append-only log, so
-     * search_context still indexes them, decompress restores them, and the
+     * recall still indexes and restores them, and the
      * model can re-run the compress tool over the marker later to write a real
      * summary. Returns null when nothing eligible exists (nothing to reclaim).
      */

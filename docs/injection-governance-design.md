@@ -27,7 +27,7 @@
 
 评审修正：
 - 原实现用私有谓词 `isCompactionCheckpoint()` 重复了 `isCheckpointNode` 的判断——删除，单一谓词（评审 fix #5）。
-- 原中文标记改为英文：工具输出（decompress 头行、nudge breakdown、acp_status 块行）整体是英文词汇表，中文标记在其中是异类（评审 fix #8；若后续要本地化应整表一起做）。
+- 原中文标记改为英文：工具输出（recall 块头行、nudge breakdown、acp_status 块行）整体是英文词汇表，中文标记在其中是异类（评审 fix #8；若后续要本地化应整表一起做）。
 - 真实用户消息（`source.kind === 'user'`）**永不加框**（tests/injection-governance.test.ts B1-4）。
 
 ## 2. B2 —— 未变化注入帧折叠：**为什么移除**

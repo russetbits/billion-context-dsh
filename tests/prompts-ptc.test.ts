@@ -80,7 +80,10 @@ test('PTC 2: native mode is byte-identical — nothing the PTC work adds leaks i
   assert.ok(!rendered.includes('await tools.'), 'no SDK form in the native system prompt')
   assert.ok(!rendered.includes(PTC_SYSTEM_LINE.slice(0, 40)), 'no PTC convention line in the native system prompt')
   assert.ok(!DEFAULT_PROMPTS.tools.compress.includes('await tools.'), 'native compress description unchanged')
-  assert.ok(DEFAULT_PROMPTS.tools.compress.includes('Single range: compress({ content'), 'native call shape intact')
+  // The description was rewritten into key/value lines on 2026-11-25 (content:,
+  // condense:, moments: ...). What this pins is the CONTRACT, not the label: the
+  // native, non-SDK call shape is still the one the description teaches.
+  assert.ok(DEFAULT_PROMPTS.tools.compress.includes('compress({ content: [{ startSeq, endSeq, summary'), 'native call shape intact')
   assert.ok(DEFAULT_PROMPTS.rangeTable.footer.startsWith('fold = re-prefilling'), 'native footer shape intact')
   assert.equal(ptcText(rendered, 'native'), rendered, 'ptcText is identity in native mode')
 })
@@ -89,21 +92,21 @@ test('PTC 3: every model-visible call shape becomes the run_code SDK form', () =
   const ptc = toPtcPrompts(DEFAULT_PROMPTS)
   assert.ok(ptc.systemPromptTemplate.startsWith(PTC_SYSTEM_LINE), 'convention stated once at the top of the system prompt')
   assert.ok(ptc.tools.compress.includes('await tools.compress({'), 'compress description carries the SDK form')
-  // The native decompress description names no call shape at all, so there is
-  // nothing to rewrite there — its SDK form is stated by the convention line.
-  assert.equal(ptc.tools.decompress, DEFAULT_PROMPTS.tools.decompress, 'decompress description has no call shape to rewrite')
-  assert.ok(ptc.systemPromptTemplate.includes('await tools.decompress({ blockId })'), 'decompress SDK form stated in the convention line')
-  assert.ok(ptc.tools.searchContext.includes('await tools.search_context('), 'search_context description carries the SDK form')
+  // The native recall description names its own call shapes (query / blockId /
+  // seq), so the rewrite has to reach it — and the convention line carries the
+  // same SDK form.
+  assert.ok(ptc.tools.recall.includes('await tools.recall({'), 'recall description carries the SDK form')
+  assert.ok(ptc.systemPromptTemplate.includes('await tools.recall({ blockId })'), 'recall SDK form stated in the convention line')
+  assert.ok(ptc.systemPromptTemplate.includes('await tools.recall({ query })'), 'recall search SDK form stated in the convention line')
   assert.ok(ptc.rangeTable.footer.startsWith(PTC_FOOTER_NOTICE), 'range-table footer names the reachable shape first')
   // No bare direct-call shape survives anywhere in the PTC copy.
   for (const text of [
     ptc.systemPromptTemplate,
     ptc.tools.compress,
-    ptc.tools.decompress,
-    ptc.tools.searchContext,
+    ptc.tools.recall,
     ptc.rangeTable.footer,
   ]) {
-    assert.ok(!/(?<!tools\.)\b(?:compress|decompress|search_context|acp_status)\(\{/.test(text), 'no direct-call shape left')
+    assert.ok(!/(?<!tools\.)\b(?:compress|recall|acp_status)\(\{/.test(text), 'no direct-call shape left')
   }
   // The nudge group keeps its object identity so the kernel renderer still runs.
   assert.equal(ptc.nudge, DEFAULT_PROMPTS.nudge, 'nudge group identity preserved (kernel path stays on)')
@@ -154,8 +157,8 @@ test('PTC 6: a leaked direct call gets one correction line on the nudge', () => 
 test('PTC 7: tool-result hints follow the mode', () => {
   assert.equal(callHint('native', 'compress', '{ content: [...] }'), 'compress({ content: [...] })')
   assert.equal(callHint('ptc', 'compress', '{ content: [...] }'), 'await tools.compress({ content: [...] })')
-  assert.equal(callHint('ptc', 'decompress', '{ blockId }'), 'await tools.decompress({ blockId })')
-  assert.equal(callHint('native', 'decompress', '{ blockId }'), 'decompress({ blockId })')
+  assert.equal(callHint('ptc', 'recall', '{ blockId }'), 'await tools.recall({ blockId })')
+  assert.equal(callHint('native', 'recall', '{ blockId }'), 'recall({ blockId })')
 })
 
 /** Engine wiring: a pinned config applies at mount; `auto` starts native and

@@ -48,7 +48,7 @@ export declare function detectPtcMode(texts: Iterable<string>): boolean;
  * substitutes `{identifier}` placeholders, so example calls must keep spaces
  * inside their braces (`{ blockId }`, not `{blockId}`) or the render throws.
  */
-export declare const PTC_SYSTEM_LINE = "Calling convention in this session (PTC / code mode): `run_code` is the only directly callable tool \u2014 reach the ACP tools from inside a `run_code` program (`await tools.compress({ content: [...] })`, `await tools.acp_status({})`, `await tools.decompress({ blockId })`, `await tools.search_context({ query })`). A direct call naming them produces no call and no error \u2014 it silently emits text. Build summary strings from single-quoted lines joined by a newline; template literals break on the backticks summaries contain.";
+export declare const PTC_SYSTEM_LINE = "Calling convention in this session (PTC / code mode): `run_code` is the only directly callable tool \u2014 reach the ACP tools from inside a `run_code` program (`await tools.compress({ content: [...] })`, `await tools.acp_status({})`, `await tools.recall({ blockId })`, `await tools.recall({ query })`). A direct call naming them produces no call and no error \u2014 it silently emits text. Build summary strings from single-quoted lines joined by a newline; template literals break on the backticks summaries contain.";
 /** One short line for the range-table footer (the per-step decision point). */
 export declare const PTC_FOOTER_NOTICE = "PTC mode: call it inside `run_code` \u2014 `await tools.compress({ content: [...] })`; a direct call fails silently.";
 /** The compress-description clause (the SDK renders it into `ToolArgsMap`). */
@@ -56,8 +56,12 @@ export declare const PTC_TOOL_CLAUSE = "PTC mode: call it as `await tools.compre
 /** Direct-call syntax → the `run_code` SDK form. The `(?<!tools\.)` guard keeps
  *  the rewrite idempotent (a re-scan must not double-prefix what it just wrote)
  *  and leaves prose mentions of the tool names alone — only `name({` and
- *  `search_context(query)` are call shapes. Exported for the nudge path, which
- *  rewrites the ALREADY-RENDERED kernel text rather than its templates. */
+ *  `name(query)` are call shapes. Exported for the nudge path, which rewrites
+ *  the ALREADY-RENDERED kernel text rather than its templates.
+ *
+ *  The retired names (`decompress` / `search_context`) are rewritten too: a
+ *  `config.prompts` override written before the merge still carries them, and
+ *  text that names a tool the surface no longer has is worse than stale prose. */
 export declare function toPtcCallSyntax(text: string): string;
 /** Render-time mode switch for text the kernel produced (the nudge): rewrite the
  *  call shapes when the session is in PTC mode, byte-identical otherwise. */
@@ -77,7 +81,7 @@ export declare function ptcText(text: string, style: ResolvedCallStyle): string;
  */
 export declare function toPtcPrompts(prompts: ResolvedPrompts): ResolvedPrompts;
 /** The call hint used in tool RESULT text (errors / recommendations). */
-export declare function callHint(style: ResolvedCallStyle, name: 'compress' | 'decompress', shape: string): string;
+export declare function callHint(style: ResolvedCallStyle, name: 'compress' | 'recall', shape: string): string;
 /** One-shot correction appended to the next nudge after a leaked direct call was
  *  detected. The host gives the model NO error result in that case (the markup
  *  lands as assistant text), so an nudge is the only channel that can say so. */

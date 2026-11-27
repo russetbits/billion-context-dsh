@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 import { createCore, type CompressionCore } from 'acp-kernel'
 import { Session } from '@deepseek-ai/dsh-session'
 import { AcpStateStore } from '../src/state.ts'
-import { condenseDegradable, condenseFloorRefusal, makeTools, type ToolEnvironment } from '../src/tools.ts'
+import { condenseFloorRefusal, makeTools, type ToolEnvironment } from '../src/tools.ts'
 import {
   foldPricingFor,
   WORKING_SET_FLOOR_MAX_TOKENS,
@@ -26,7 +26,7 @@ import { buildCompressibleSeqRanges, DEFAULT_FOLD_FLOOR_PCT } from '../src/regio
 import { rangeTable } from '../src/nudge.ts'
 import { appendAssistant, appendTurn, appendUser, longText, wholeSurfaceRangeView } from './helpers.ts'
 
-const NOTE = ['## Goal', 'Finish the fold-floor guard.', '## Next', 'Run the suite; 0 fail is the completion condition.'].join('\n')
+const NOTE = ['## Task', 'Guard the fold floor against a stranded working set.', '## Goal', 'Finish the fold-floor guard.', '## Next', 'Run the suite; 0 fail is the completion condition.'].join('\n')
 
 function envWith(limit: number, foldFloorPct?: number): ToolEnvironment {
   return {
@@ -73,7 +73,7 @@ test('a surface smaller than the floor is never guarded — the floor needs room
   // floor protects a working set that could have been kept, not a wish.
   const definition = makeTools(envWith(262144)).find((candidate) => candidate.name === 'compress')
   const result = await definition!.execute({ condense: { summary: NOTE } } as never, execStub(session) as never)
-  assert.match((result as { text: string }).text, /condense elected seqs/, 'no refusal when the floor exceeds the whole surface')
+  assert.match((result as { text: string }).text, /condense folds \d+t/, 'no refusal when the floor exceeds the whole surface')
   assert.equal(session.snapshotEvents().filter((event) => event.type === 'compaction/summary').length, 1)
 })
 
@@ -114,21 +114,29 @@ test('a row that would strand the working set is marked in the table', () => {
   assert.match(table, /STILL LEAVES the floor/, 'and points at the row that is safe, not the widest one')
 })
 
-test('condense degrades when no eligible row can keep the floor, and stamps it', async () => {
+test('a below-floor condense is refused with the branch that fits the row set', async () => {
   const session = workFixture('floor-refuse')
-  // floor clamps to 8192: over the ~6197 that would stay, under the 12392 surface.
-  // Every row of this fixture is below the floor, so there is NO compliant fold —
-  // refusing here is the deadlock the round-3 reviews reported.
+  // M-3: before the payback gate was removed this fixture was refused as a WHOLE
+  // (the below-floor shape could not be elected at all). Now the engine elects the
+  // one row that still clears BOTH capacity conditions and refuses the rest row by
+  // row on the content path — so the below-floor refusal copy is pinned by feeding
+  // the elected pick straight to `condenseFloorRefusal` (the branch test above) and
+  // the tool-level behavior is pinned by the explicit-range guard instead.
+  // The tool-level guard for a below-floor range stays: an EXPLICIT range that
+  // would strand the floor is refused with the compliant moves, and force escapes it.
   const definition = makeTools(envWith(16000, 0.5)).find((candidate) => candidate.name === 'compress')
+  const nodes = session.surface.nodes as readonly number[]
+  const ranges = buildCompressibleSeqRanges(session, wholeSurfaceRangeView(session), { foldPricing: { floorTokens: 8192 } })
+  const belowRow = ranges.find((range) => range.belowFloor)!
   const result = await definition!.execute(
-    { condense: { summary: NOTE } } as never,
+    { content: [{ startSeq: belowRow.start, endSeq: belowRow.end, summary: NOTE }] } as never,
     execStub(session) as never,
   )
   const text = (result as { text: string }).text
-  assert.match(text, /condense elected seqs/, 'the only available move is taken')
-  assert.match(lastSummaryText(session), /\[dsh:degraded\]/, 'one machine-readable provenance line')
-  assert.match(lastSummaryText(session), /no eligible row could keep the working-set floor/, 'states why it is desperate')
-  assert.equal(session.snapshotEvents().filter((event) => event.type === 'compaction/summary').length, 1, 'one summary written')
+  assert.match(text, /under the working-set floor/, 'the explicit range is refused for the floor')
+  assert.match(text, /force:true/, 'the escape hatch is named')
+  assert.equal(session.snapshotEvents().filter((event) => event.type === 'compaction/summary').length, 0, 'nothing written')
+  void nodes
 })
 
 test('force folds it anyway — overflow pressure is a legitimate override', async () => {
@@ -139,57 +147,33 @@ test('force folds it anyway — overflow pressure is a legitimate override', asy
     execStub(session) as never,
   )
   const text = (result as { text: string }).text
-  assert.match(text, /condense elected seqs/, 'the forced fold lands')
+  assert.match(text, /condense folds \d+t/, 'the forced fold lands')
   assert.equal(session.snapshotEvents().filter((event) => event.type === 'compaction/summary').length, 1, 'one summary written')
 })
 
-test('the refusal separates the three situations it can mean', () => {
-  const pick = {
-    start: 1, end: 4, count: 4, tokens: 9000, foldCostTokens: 3000, liveAfterFoldTokens: 2000,
-    belowFloor: true, guardedRowCount: 3, eligibleRangeCount: 2,
-  }
-  const compliant = condenseFloorRefusal({ ...pick, aboveFloorAvailable: true }, 8000)
-  assert.match(compliant, /AN ELIGIBLE ROW STILL LEAVES THE FLOOR/)
-  assert.match(compliant, /widest row is the one that strands/, 'names the direction: wider is the danger, not the fix')
-  assert.doesNotMatch(compliant, /NO ELIGIBLE ROW LEAVES THE FLOOR/)
-  // Guards fragment the area: telling this session to stop compressing is wrong,
-  // and telling it to widen is a loop into the guard.
-  const fragmented = condenseFloorRefusal({ ...pick, aboveFloorAvailable: false }, 8000)
-  assert.match(fragmented, /NO ELIGIBLE ROW LEAVES THE FLOOR/)
-  assert.match(fragmented, /Do NOT widen blindly/)
-  assert.match(fragmented, /force:true/, "names the only compliant escape")
-  assert.doesNotMatch(fragmented, /AN ELIGIBLE ROW STILL LEAVES/)
-  const nothing = condenseFloorRefusal({ ...pick, aboveFloorAvailable: false, eligibleRangeCount: 0 }, 8000)
-  assert.match(nothing, /NOTHING ELSE IS ELIGIBLE AT ALL/)
-  assert.match(nothing, /stop compressing and keep working/)
-})
-
-test('degrading needs the absence of a compliant row, not a fold count', () => {
+test('the refusal names WHICH gate failed and its arithmetic', () => {
+  // 2026-11-25 (M-3): ONE gate. The refusal names capacity and its numbers — a
+  // refusal that does not name the gate and its arithmetic leaves the model
+  // guessing, and guessing means a retry of the same shape. Payback/cost stay
+  // REPORTED in the head line but gate nothing, so no gate branch can be invented.
   const base = {
-    start: 1, end: 4, count: 4, tokens: 9000, foldCostTokens: 3000, liveAfterFoldTokens: 2000,
-    belowFloor: true, aboveFloorAvailable: false, guardedRowCount: 3, eligibleRangeCount: 2, degraded: false,
+    spans: [{ start: 1, end: 4, endBlock: null, carriers: [], tokens: 9000 }],
+    tokens: 9000, noteTokens: 900, keptTokens: 2000, floorTokens: 8000,
+    belowFloor: true, aboveFloorAvailable: false, guardedRowCount: 3, eligibleRangeCount: 2,
+    carrierCount: 0, foldCostTokens: 9000, paybackRequests: 1,
+    gates: { capacity: false },
   }
-  assert.equal(condenseDegradable({ ...base, aboveFloorAvailable: true }, 4096), false,
-    'a row that keeps the floor exists — fold it, do not strand the working set')
-  assert.equal(condenseDegradable(base, 4096), true, "nothing compliant left, so the fold is the only move")
-  assert.equal(condenseDegradable({ ...base, tokens: 3000 }, 4096), false,
-    'under MIN_DEGRADED_FOLD_TOKENS the barrier buys almost nothing — refuse')
-  assert.equal(condenseDegradable({ ...base, belowFloor: false }, 4096), false, "compliant folds never take the degraded path")
-})
+  const floor = condenseFloorRefusal(base as never, 8000)
+  assert.match(floor, /floor gate/, 'the capacity gate is named')
+  assert.match(floor, /short by ~6000/, 'and the shortfall is printed')
+  assert.match(floor, /force:true/, 'the only compliant escape')
+  assert.doesNotMatch(floor, /payback gate|cost gate/, 'the removed gates are gone entirely')
 
-
-function lastSummaryText(session: Session): string {
-  const events = session.snapshotEvents().filter((event) => event.type === 'compaction/summary')
-  const data = events.at(-1)?.data as { summary?: { text?: string }[] } | undefined
-  return data?.summary?.map((block) => block.text ?? '').join('\n') ?? ''
-}
-
-test('a compliant row keeps the refusal, so the stamp never rides a voluntary fold', async () => {
-  const session = workFixture('floor-force')
-  // force is the operator's own desperation and must NOT be labelled as the
-  // engine's degraded election — a floor statistic reading the stamp would count
-  // a forced fold as one the rows left no choice about.
-  const definition = makeTools(envWith(16000, 0.5)).find((candidate) => candidate.name === 'compress')!
-  await definition.execute({ condense: { summary: NOTE, force: true } } as never, execStub(session) as never)
-  assert.doesNotMatch(lastSummaryText(session), /\[dsh:degraded\]/, 'a forced fold carries no degrade provenance')
+  // A pick that only REPORTS a slow payback (no gate can fail but capacity) is
+  // refused for another reason only via the every-gate-passes branch.
+  const passing = condenseFloorRefusal({
+    ...base, gates: { capacity: true }, belowFloor: false,
+    keptTokens: 12000, foldCostTokens: 27000, paybackRequests: 3,
+  } as never, 8000)
+  assert.match(passing, /every gate passes/, 'a capacity-passing shape is not invented a floor failure')
 })

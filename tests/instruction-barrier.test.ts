@@ -331,21 +331,24 @@ test('PR1: handleCompress REJECTS a manual range covering a current instruction 
   // offered so the model can re-cut instead of retrying the same call.
   const result = await compress.execute({ content: [{ startSeq: 1, endSeq: 7, summary }] } as never, exec)
   const text = (result as { text: string }).text
-  assert.match(text, /Compressed 0 block/)
-  assert.match(text, /seqs \d+\.\.\d+ rejected/)
-  assert.match(text, /seq 6/, 'the current row is named')
+  // Since 2026-11-25 the range is CUT AROUND the current row instead of refused:
+  // the CURRENT copy stays live (that is the constraint), the older side lands,
+  // and the model gets its fold in this call rather than in a re-cut.
+  assert.match(text, /Compressed 1 block\(s\) from 1 range \(split around 1 protected line\)/)
   assert.ok(
-    !sessionEventsOf(session).some((event) => String((event as { type?: string }).type).startsWith('compaction')),
-    'nothing durable landed — the kernel never saw the rejected range',
+    sessionEventsOf(session).some((event) => String((event as { type?: string }).type).startsWith('compaction')),
+    'the surviving side landed — the cut is executed in THIS call',
   )
+  assert.ok(session.surface.nodes.includes(6 as never), 'the CURRENT instruction copy stays visible')
 
-  // A span covering only the STALE copy of the same file (seq 5, superseded
-  // by v2 at seq 6) compresses normally: removing it while the newest stays
-  // visible is the real cleanup and triggers no re-injection.
+  // The STALE copy (seq 5, superseded by v2 at seq 6) folded with the cut above —
+  // removing it while the newest stays visible is the real cleanup. Re-sending its
+  // span now reports that instead of writing a second block, which is the proof
+  // the cut folded the stale side and LEFT the current one alone.
   const staleOnly = await compress.execute({ content: [{ startSeq: 1, endSeq: 5, summary }] } as never, exec)
   const staleText = (staleOnly as { text: string }).text
-  assert.match(staleText, /Compressed 1 block/)
-  assert.doesNotMatch(staleText, /rejected|current instruction row/)
+  assert.match(staleText, /already compressed/)
+  assert.doesNotMatch(staleText, /current instruction row/)
 
   // Negative: a plain session without any instruction rows — the gate never
   // fires (guards against false positives from the gate itself).
@@ -520,7 +523,7 @@ test('PR1: the rejection names the compressible slices so the model can re-cut i
   assert.match(note, /seq 20/, 'the offending row is named')
   assert.match(note, /must stay visible on the surface/, 'unknown channels get the generic reason')
   assert.match(note, /seq 10\.\.12 and 30\.\.31/, 'the legal slices on both sides are named')
-  assert.match(note, /separate content entries/, 'the model gets an actionable re-cut, not just "shrink the range"')
+  assert.match(note, /cuts around those rows automatically/, 'the model learns the engine now makes the cut itself')
   const fullyCovered = protectedRowRejectionNote(10, 12, [10, 12], [10, 11, 12], session)
   assert.match(fullyCovered, /no part of this span is compressible/, 'a fully covered span says so instead of implying a cut exists')
 })
@@ -592,19 +595,16 @@ test('PR #196: handleCompress hard-rejects a span covering the newest real user 
   // (not the AGENTS.md story), and the re-cut is offered.
   const result = await compress.execute({ content: [{ startSeq: 1, endSeq: 9, summary }] } as never, exec)
   const text = (result as { text: string }).text
-  assert.match(text, /Compressed 0 block/)
-  assert.match(text, /seqs \d+\.\.\d+ rejected/)
-  assert.match(text, /seq 9/, 'the active user turn is named')
-  assert.match(text, /active user message must stay live/)
+  // The span is cut around the active turn: everything BEFORE it lands, the turn
+  // itself stays live (the invariant that matters), and no retry is needed.
+  assert.match(text, /Compressed 1 block\(s\) from 1 range \(split around 1 protected line\)/)
+  assert.ok(session.surface.nodes.includes(9 as never), 'the active user turn stays visible')
   assert.doesNotMatch(text, /stale copies/, 'no AGENTS.md escape applies to a user message')
-  assert.ok(
-    !sessionEventsOf(session).some((event) => String((event as { type?: string }).type).startsWith('compaction')),
-    'nothing durable landed — the kernel never saw the rejected range',
-  )
 
-  // The re-cut the note offers succeeds: everything BEFORE the active turn compresses.
+  // Re-sending the same span proves the cut folded everything BEFORE the turn:
+  // the range is already compressed, so no second block is written.
   const recut = await compress.execute({ content: [{ startSeq: 1, endSeq: 8, summary }] } as never, exec)
-  assert.match((recut as { text: string }).text, /Compressed 1 block/, 'span 1..8 (before the user turn) compresses normally')
+  assert.match((recut as { text: string }).text, /already compressed/, 'span 1..8 (before the user turn) folded with the cut')
 
   // The human path explains the same reason (src/commands.ts passes the session through).
   const command = acpCommand(env)
@@ -616,6 +616,9 @@ test('PR #196: handleCompress hard-rejects a span covering the newest real user 
   } as never) as Promise<{ kind: string; text: string }>
   const human = await run(`compress 1 10 ${summary}`)
   assert.equal(human.kind, 'success')
+  // The HUMAN path (`/acp-prune compress`) keeps its own hard rejection: the
+  // cut-around lives in the tool's content path, so the command still refuses and
+  // names the user-turn reason. Pinned so the two cannot drift silently.
   assert.match(human.text, /rejected/)
   assert.match(human.text, /active user message must stay live/, '/acp-prune compress names the user-turn reason too')
   assert.doesNotMatch(human.text, /injected instruction row/, 'a user-turn-only hit is not mislabelled as an instruction row')

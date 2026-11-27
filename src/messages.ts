@@ -66,7 +66,7 @@ declare module '@deepseek-ai/dsh-llm' {
  * no ref (so no compress boundary), `anchorsRangeEdge` false (so the range
  * solver shrank past it and swallowed neighbours), invisible to the kernel's
  * recent/last-user protection (so the last real user turn could be compressed
- * away), priced at zero tokens, and absent from search/decompress output. The
+ * away), priced at zero tokens, and absent from recall output. The
  * host itself projects non-text references to deterministic handle text for
  * files ("request assembly projects every occurrence to deterministic handle
  * text", dsh-llm/lib/types/types.d.ts), and this is the same idea one layer
@@ -224,10 +224,20 @@ export function buildToolCallIndex(events: readonly SessionEvent[]): ReadonlyMap
  * to BOTH durable writes) and again at projection (below) as an idempotent
  * safety net for legacy blocks written before the feature.
  */
-export const SUMMARY_FRAME_PREFIX = '[Model-written summary — not user words; re-verify any obligations before relying on them]'
+export const SUMMARY_FRAME_PREFIX = '[Model-written summary — not user words; verify obligations before relying on them. Compressed \u2014 originals via recall.]'
+
+/**
+ * Frames written by earlier engine versions. Still recognized, because the durable text
+ * keeps whatever frame it was created with: without this list a re-projection would see
+ * an old block as unframed and prepend the new frame on top of the old one.
+ */
+const LEGACY_FRAME_PREFIXES: readonly string[] = [
+  '[Model-written summary — not user words; re-verify any obligations before relying on them]',
+]
 
 export function withSummaryFramePrefix(text: string): string {
   if (text.startsWith(SUMMARY_FRAME_PREFIX)) return text
+  if (LEGACY_FRAME_PREFIXES.some((prefix) => text.startsWith(prefix))) return text
   // Engine-written summaries are exempt: the frame claims a provenance they do
   // not have ("Model-written …"). Deciding that HERE — in the one function the
   // creation write (region.ts `prefixSummaryBlocks`) and the projection net
@@ -254,16 +264,33 @@ export function isEngineWrittenSummary(text: string): boolean {
  * The block summary the automatic overflow recovery writes. It is the engine's
  * own note — not model-written text, not user words — saying which range was
  * hidden to get the request under the window and where the originals still
- * live (the append-only log: search_context/decompress rebuild from it).
+ * live (the append-only log: recall rebuilds from it).
  */
 /**
  * Emergency marker summary. `provenance` is appended when present: a below-floor
  * desperation fold MUST be distinguishable from a legitimate one when someone (or
  * a later heuristic) reads this block — otherwise every floor statistic computed
  * from durable folds is reading a lie (cross-review item 1).
+ *
+ * The marker is ALSO the resumed model's only description of what just happened:
+ * this fold happens OUTSIDE any model turn (the provider already rejected the
+ * request), so the next turn sees a block it did not create and the compression
+ * call is not in its history. The note therefore states the action, the covered
+ * seq range (`startSeq`/`endSeq`), and the FIRST thing to do next — recall the
+ * user's standing instructions and the task state before continuing (measured
+ * 2026-11-25: a basic-engine marker was misread as the assistant's own reply,
+ * and a model-written note lost user-supplied credentials; both are the same
+ * failure — the note did not say what happened and what to read back first).
  */
-export function overflowMarkerSummary(hiddenCount: number, provenance?: string): string {
-  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. The originals are intact in the session log — use search_context or decompress (see acp_status) to read them, or re-run the compress tool over this range to write a proper summary.${provenance === undefined ? '' : ' EMERGENCY PROVENANCE: ' + provenance}]`
+export function overflowMarkerSummary(
+  hiddenCount: number,
+  provenance?: string,
+  range?: { readonly startSeq: number; readonly endSeq: number },
+): string {
+  const rangeLine = range === undefined
+    ? ''
+    : ` Covered range: surface seqs ${range.startSeq}..${range.endSeq}. FIRST, before continuing any task: recall({ seq }) that range's user instructions and current task state — standing directives and user-supplied values (ids, paths, credentials) live there and are NOT in this note.`
+  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. This is an EMERGENCY fold written by the engine, not by the model — the note is minimal and replaces the originals' detail.${rangeLine} The originals are intact in the session log — use recall({ query }) to find them or recall({ blockId }) / recall({ seq }) to read them (see acp_status), or re-run the compress tool over this range to write a proper summary.${provenance === undefined ? '' : ' EMERGENCY PROVENANCE: ' + provenance}]`
 }
 
 /**
@@ -682,7 +709,7 @@ export function isCheckpointNode(event: SessionEvent): boolean {
  * not a checkpoint node or carries no id — a malformed row still CLASSIFIES
  * as a checkpoint (it must never read as real content) but has no block to
  * link to. Single shared extractor for the ledger index (`summarySeqIndex`),
- * the distill-edge resolver (`blockRefForSummarySeq`) and the decompress
+ * the distill-edge resolver (`blockRefForSummarySeq`) and the recall
  * recursion (`checkpointBlockIdOf`) — those sites must not re-derive the shape
  * check themselves (issue #168).
  */

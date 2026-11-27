@@ -77,7 +77,7 @@
     {
       "kind": "tool",
       "name": "compress",
-      "argsTemplate": "{\"condense\":{\"summary\":\"## Goal\\nVerify condense (engine-elected stretch, model-written note) end to end on a real host.\\n## Next\\nReinstall dist into the profile and run one real condense call.\\nEstablished facts: E2E-CONDENSE-MARKER-7f3a — the four short exchanges are fully consumed; their bytes stay in the log for decompress. The long exchange is still live work.\\nRemaining plan: read the next request cost, then report.\",\"topic\":\"condense handoff\"}}"
+      "argsTemplate": "{\"condense\":{\"summary\":\"## Goal\\nVerify condense (engine-elected stretch, model-written note) end to end on a real host.\\n## Next\\nReinstall dist into the profile and run one real condense call.\\nEstablished facts: E2E-CONDENSE-MARKER-7f3a — the four short exchanges are fully consumed; their bytes stay in the log for recall. The long exchange is still live work.\\nRemaining plan: read the next request cost, then report.\",\"topic\":\"condense handoff\"}}"
     },
     {
       "kind": "text",

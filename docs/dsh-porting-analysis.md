@@ -19,7 +19,7 @@ DSH 仓库里的 `packages/acp` 是 **Agent Client Protocol**（进程间自动�
   - `pi.on('session_before_compact')` — 取消 Pi 内置自动压缩。
   - `pi.on('session_start'/'session_shutdown')` — 生命周期。
   - `pi.on('before_agent_start')` — 注入 ACP 系统提示词。
-- 注册 4+ 工具：`compress`（模型写摘要替换范围）、`decompress`（把块恢复回上下文）、`search_context`（在压缩块内搜索）、`acp_status`（压缩统计）；外加 delegate 三件套（`acp_delegate`/`acp_delegate_wait`/`acp_delegate_cancel`）。
+- 注册模型工具：`compress`（模型写摘要替换范围）、`recall`（一个入口两种形态：读回原文 + 在压缩块内检索——pi 侧是独立的 `decompress` / `search_context`）、`acp_status`（压缩统计）；外加 delegate 三件套（`acp_delegate`/`acp_delegate_wait`/`acp_delegate_cancel`）。
 - （补注，2026-10-04）上游另有 opt-in 的第五个模型工具 `acp_rule`（永久规则层：登记能穿越压缩的原则级提醒；上游内核 v0.0.80+ 才提供规则 API）——初版移植清单漏了此项，当前仍未移植，计划见 [issue #189](https://github.com/Tyan66666/billion-context-dsh/issues/189)。
 - 注册 `/acp-prune` slash 命令；自动更新检查；状态持久化到 `~/.pi/agent/sessions/*.acp.json` 旁车文件。
 - **acp-kernel 是纯内核**（"Framework-agnostic context-compression engine. Pure core: no host dependency"），tsup 构建时内联进 dist。这意味着压缩算法本身**可原样复用**，只需重写 Pi↔kernel 的适配层。
@@ -73,8 +73,8 @@ DSH 仓库里的 `packages/acp` 是 **Agent Client Protocol**（进程间自动�
 | `pi.on('session_before_compact')` 取消内置压缩 | 更干净：preset 组合里不挂 `compaction-basic` 即可（"What a preset chooses is whether its agent compacts at all"） | 🟢 零成本 |
 | `pi.on('before_agent_start')` 系统提示词 | `dsh-system-prompt` persona / prompt sections（`dsh-persona`、各插件 section） | 🟢 直接对应 |
 | `pi.registerTool(compress)` | `ctx.tools.register(ToolDefinition)`（`dsh-tools` registry） | 🟢 直接对应 |
-| `pi.registerTool(decompress)` | 需自实现"反遮蔽"：把 checkpoint 节点 replace 回原文（原文仍在日志中，可回放恢复） | 🟡 设计取舍 |
-| `pi.registerTool(search_context)` | 落地为：从日志重建统一文档集（块摘要 + 被遮蔽原文），交 acp-kernel `searchBlocks`（hybrid：BM25 词干化 + CJK bigram + 字符 n-gram 模糊）打分；**信任内核**——引擎不做无命中闸门/阈值等二级搜索策略，评分直接呈现给模型自行判断；消息命中回链最内层所属块。`ctx.sessionQuery` 全文索引（`openAt: 'first-search'`）留作二期可选项 | 🟢 直接复用内核（无 opt-in 依赖） |
+| `pi.registerTool(decompress)` | 需自实现"反遮蔽"：把 checkpoint 节点 replace 回原文（原文仍在日志中，可回放恢复）；DSH 侧现为 `recall` 的读形态 | 🟡 设计取舍 |
+| `pi.registerTool(search_context)` | 落地为 `recall` 的检索形态（`recall({ query })`）：从日志重建统一文档集（块摘要 + 被遮蔽原文 + 仍可见表面），交 acp-kernel `searchBlocks`（hybrid：BM25 词干化 + CJK bigram + 字符 n-gram 模糊）打分；**信任内核**——引擎不做无命中闸门/阈值等二级搜索策略，评分直接呈现给模型自行判断；消息命中回链最内层所属块。`ctx.sessionQuery` 全文索引（`openAt: 'first-search'`）留作二期可选项 | 🟢 直接复用内核（无 opt-in 依赖） |
 | `pi.registerTool(acp_status)` | `ctx.tokenMeter` 投影（`contextPressure`/`contextBreakdown`） | 🟢 直接对应 |
 | `pi.registerCommand(/acp-prune)` | `ctx.commands`（`dsh-command-compact` 是现成参考） | 🟢 直接对应 |
 | 状态持久化 `*.acp.json` 旁车文件 | 会话日志本身 durable；ACP 块状态可写成自定义日志事件（如 `acp/block`，回放友好，且自动获得 checkpoint）或 storage key | 🟢 更优 |
@@ -94,7 +94,7 @@ Pi 的 ACP 把消息数组在内存中转换（剪枝 + 打 ref 标签 + 附加 
 - `compress` 工具 = `compactRegion(start, end)` 且摘要由**模型自己写**（不再需要二次 LLM 摘要调用，这正是 ACP 的卖点——比 DSH 现有自动摘要更省 token、保真度更高）。
 - nudge：在 `agent/pre-step` 里把 ACP nudge 作为注入消息 append（与现有 `agent-inject` 机制一致）。
 - 引用标签重设计：由于没有 in-memory 改写钩子，可以"**seq 即 ref**"（surface 节点有稳定 seq），nudge 消息携带可压缩范围表，模型用 seq 范围调用 `compress`。
-- `decompress`：把 checkpoint 节点 replace 回原文（日志里还有原始事件，可重建）。
+- `recall` 的读形态（pi 侧 `decompress`）：把 checkpoint 节点 replace 回原文（日志里还有原始事件，可重建）。
 - 块状态：写成会话日志的自定义事件（`acp/block`），天然获得持久化 + 回放 + checkpoint。
 
 优点：不动 DSH 核心；语义与现有 seam 完全兼容；preset 换一行配置即切换压缩后端。缺点：丢掉了"给历史消息打 `<acp>` 标签"的视觉/引用机制，需要接受 seq-as-ref 或 nudge 范围表。
@@ -114,7 +114,7 @@ durable 部分（压缩、块状态、搜索、状态）走路径 A；只把"易
 1. **包形态**：新建一个压缩能力族叶子包（对齐 `packages/compaction/` 下现有结构，或独立 npm 包），实现 `CompactionEngine` 接口 + 注册 `compress`/`decompress`/`search_context`/`acp_status` 四个模型工具 + `/acp-prune` 命令。
 2. **组合接入**：host 组合加一行提供 `ctx.compaction`；preset 里在 `compaction` isolate realm 用 ACP 后端替换 `compaction-basic`（或新增一个 preset 变体）。这与 DSH 的 capability-seam 哲学完全一致。
 3. **复用内核**：`acp-kernel` 直接作为依赖（或内联），只重写适配层（Pi 的 `ExtensionAPI`/`SessionEntry`/`AgentMessage` ↔ DSH 的 `Session` 事件日志/surface/`Message`）。
-4. **状态与搜索**：ACP 块状态写成日志事件；`search_context` 基于 `ctx.sessionQuery`（需要把 `openAt` 从 `never` 改为 `first-search`）。
+4. **状态与搜索**：ACP 块状态写成日志事件；检索（今 `recall({ query })`，pi 侧 `search_context`）基于 `ctx.sessionQuery`（需要把 `openAt` 从 `never` 改为 `first-search`）。
 5. **可选核心扩展**：若确实要保留逐消息 ref 标签体验，再评估路径 B 的最小钩子（单独一个 PR，不阻塞主移植）。
 
 ## 6. 工作量与风险
@@ -124,7 +124,7 @@ durable 部分（压缩、块状态、搜索、状态）走路径 A；只把"易
 | 消息/事件适配层（SessionEntry ↔ 事件日志、AgentMessage ↔ Message、工具结果投影） | 中 | 工具调用的多块结构（`toolCall` blocks、`#` 拆分重建）是 ACP 最繁琐的代码，需要重写 |
 | `CompactionEngine` 后端 + durable replace | 中 | 必须遵守 seam 的 region 平衡规则（tool-call/result 配对）与 `compaction/start\|summary\|end` 事件契约 |
 | 4 个模型工具 | 低 | `tools.register()` 直挂 |
-| decompress / 反遮蔽 | 中 | DSH 无先例，需自己实现 replace-back |
+| 读原文（今 `recall`）/ 反遮蔽 | 中 | DSH 无先例，需自己实现 replace-back |
 | nudge 注入 + seq-as-ref 设计 | 低-中 | pre-step 注入现成，设计取舍为主 |
 | 测试 | 中 | 复用 acp-kernel 45 个测试 + DSH 的 session/agent 测试工具 |
 

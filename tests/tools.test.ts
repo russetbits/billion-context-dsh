@@ -67,7 +67,7 @@ function toolOf(env: ToolEnvironment, name: string) {
  * instead of assuming a single call returns everything.
  */
 async function decompressAll(env: ToolEnvironment, session: Session, blockId: string): Promise<string> {
-  const decompress = toolOf(env, 'decompress')
+  const decompress = toolOf(env, 'recall')
   const chunks: string[] = []
   let offset = 0
   for (;;) {
@@ -265,7 +265,7 @@ test('M3: decompress pages a large block by size and walks it with offset', asyn
   const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   const blockId = ledger[0]!.blockId
-  const decompress = toolOf(env, 'decompress')
+  const decompress = toolOf(env, 'recall')
 
   // issue #112(b): one page must come back intact, not silently trimmed — so a
   // single page's emitted text stays under the host tool-result pruner
@@ -309,9 +309,9 @@ test('M3: decompress honors an explicit limit and clamps a negative offset', asy
     }],
   } as never, fakeExec(session))
   const blockId = rebuildBlockLedger(session.snapshotEvents())[0]!.blockId
-  const decompress = toolOf(env, 'decompress')
+  const decompress = toolOf(env, 'recall')
 
-  const limited = ((await decompress.execute({ blockId, limit: 2 }, fakeExec(session))) as { text: string }).text
+  const limited = ((await decompress.execute({ blockId, pageLimit: 2 }, fakeExec(session))) as { text: string }).text
   assert.match(limited, /\[messages 1\.\.2 of 80\]/)
   assert.match(limited, /offset: 2 \}/)
   assert.doesNotMatch(limited, /\[seq 3\] /)
@@ -360,7 +360,7 @@ test('M3: decompress malformed or unknown bN forms are not found, not normalised
     }],
   } as never, fakeExec(session))
 
-  const decompress = toolOf(env, 'decompress')
+  const decompress = toolOf(env, 'recall')
   // Unknown ref, zero-padded ref, and uppercase are all NOT the canonical bN.
   // Round-14 review Q6: compaction ids are UUIDs, and `b01` is a legal UUID prefix, so the
   // compaction-id prefix fallback used to resolve such a probe to a REAL block with probability
@@ -401,7 +401,7 @@ test('M3: decompress prefers an exact bN over a compaction-id prefix collision',
   const ledger = rebuildBlockLedger(session.snapshotEvents())
   const second = ledger[1]!
 
-  const decompress = toolOf(env, 'decompress')
+  const decompress = toolOf(env, 'recall')
   const byB2 = await decompress.execute({ blockId: 'b2' }, fakeExec(session))
   assert.match(
     (byB2 as { text: string }).text,
@@ -417,7 +417,7 @@ test('M3: decompress prefers an exact bN over a compaction-id prefix collision',
   assert.match((byPrefix as { text: string }).text, /not found \(see acp_status/, 'a bN-looking hex prefix is not a kernel ref and falls through')
 })
 
-test('M3: search_context finds information inside compressed blocks', async () => {
+test('M3: recall (search form) finds information inside compressed blocks', async () => {
   const env = makeEnv()
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
@@ -429,9 +429,9 @@ test('M3: search_context finds information inside compressed blocks', async () =
     }],
   } as never, fakeExec(session))
 
-  const search = toolOf(env, 'search_context')
+  const search = toolOf(env, 'recall')
   // Real vocabulary hit: high score.
-  const hit = await search.execute({ query: 'rate limiting', limit: 5 }, fakeExec(session))
+  const hit = await search.execute({ query: 'rate limiting', maxResults: 5 }, fakeExec(session))
   const hitText = (hit as { text: string }).text
   assert.match(hitText, /Matches for "rate limiting"/)
   const hitScore = Number(/score ([\d.]+)/.exec(hitText)![1])
@@ -445,7 +445,7 @@ test('M3: search_context finds information inside compressed blocks', async () =
   assert.ok(noiseScore < hitScore, `unrelated query scores below a real hit (${noiseScore} < ${hitScore})`)
 })
 
-test('M3: search_context matches on stemmed English terms and CJK bigrams', async () => {
+test('M3: recall (search form) matches on stemmed English terms and CJK bigrams', async () => {
   const env = makeEnv()
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
@@ -457,16 +457,16 @@ test('M3: search_context matches on stemmed English terms and CJK bigrams', asyn
     }],
   } as never, fakeExec(session))
 
-  const search = toolOf(env, 'search_context')
+  const search = toolOf(env, 'recall')
   // English stemming: "rate limit" must match "rate limiting".
-  const stemmed = await search.execute({ query: 'rate limit', limit: 5 }, fakeExec(session))
+  const stemmed = await search.execute({ query: 'rate limit', maxResults: 5 }, fakeExec(session))
   assert.match((stemmed as { text: string }).text, /Matches for "rate limit"/)
   // CJK: the query tokenizes into bigrams that match the summary.
-  const cjk = await search.execute({ query: '速率限制', limit: 5 }, fakeExec(session))
+  const cjk = await search.execute({ query: '速率限制', maxResults: 5 }, fakeExec(session))
   assert.match((cjk as { text: string }).text, /Matches for "速率限制"/)
 })
 
-test('M3: search_context hits shadowed messages and reports the owning block', async () => {
+test('M3: recall (search form) hits shadowed messages and reports the owning block', async () => {
   const env = makeEnv()
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
@@ -478,16 +478,16 @@ test('M3: search_context hits shadowed messages and reports the owning block', a
     }],
   } as never, fakeExec(session))
 
-  const search = toolOf(env, 'search_context')
+  const search = toolOf(env, 'recall')
   // "expiry" appears ONLY in the shadowed message originals, not the summary —
   // hybrid must find it via the message docs and link back to the block.
-  const hit = await search.execute({ query: 'expiry', limit: 5 }, fakeExec(session))
+  const hit = await search.execute({ query: 'expiry', maxResults: 5 }, fakeExec(session))
   const text = (hit as { text: string }).text
   assert.match(text, /Matches for "expiry"/)
   assert.match(text, /message seq \d+ \(user, in block [0-9a-f-]+\)/, 'the hit names the shadowed message and its owning block')
 })
 
-test('M3: search_context on a distilled tier-2 block reports the innermost owning block', async () => {
+test('M3: recall (search form) on a distilled tier-2 block reports the innermost owning block', async () => {
   const env = makeEnv()
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
@@ -500,9 +500,9 @@ test('M3: search_context on a distilled tier-2 block reports the innermost ownin
     content: [{ startSeq: tier1.summarySeq!, endSeq: tier1.summarySeq!, summary: TIER_SUMMARY }],
   } as never, fakeExec(session))
 
-  const search = toolOf(env, 'search_context')
+  const search = toolOf(env, 'recall')
   // The originals' "[msg 0]" marker survives only in the tier-1 shadowed seqs.
-  const hit = await search.execute({ query: 'bcrypt', limit: 5 }, fakeExec(session))
+  const hit = await search.execute({ query: 'bcrypt', maxResults: 5 }, fakeExec(session))
   const text = (hit as { text: string }).text
   assert.match(text, /Matches for "bcrypt"/)
   // The message doc must claim the ORIGINAL (tier-1) block, not the tier-2 summary.
@@ -798,10 +798,10 @@ test('M3: acp_status drilldown survives multi-tool-call nodes (seq#callId ids)',
 test('M3: acp_status peels the wrapped { arguments: {...} } envelope the model channel emits', async () => {
   // Live-verified: a drilldown acp_status call arrived as
   // `{"arguments":{"scope":"compressed"}}` and silently rendered the overview —
-  // acp_status is the ONLY all-optional tool, so the envelope passes schema
-  // validation and previously dropped the params at the handler. (decompress /
-  // search_context reject the envelope at schema level — required blockId/query
-  // absent — which is a loud, correct failure; compress has its own unwrap.)
+  // acp_status and recall are both all-optional (recall has two mutually
+  // exclusive forms, so no field can be `required`), so the envelope passes
+  // schema validation and previously dropped the params at the handler. Both
+  // handlers peel it themselves; compress has its own unwrap too.
   const env = makeEnv()
   const session = buildTextSession(12)
   const status = toolOf(env, 'acp_status')
@@ -899,8 +899,7 @@ test('M3: compress schema gate rejects a range entry missing summary (required f
   // "Summary is empty", which does not name the missing field — the model
   // retried the identical broken call in a loop. startSeq/endSeq/summary are
   // now `required: true` on the items properties, so the same call is rejected
-  // at the schema gate with the exact field path (same pattern as decompress's
-  // required blockId / search_context's required query).
+  // at the schema gate with the exact field path.
   const env = makeEnv()
   const session = buildTextSession(12)
   const compress = toolOf(env, 'compress')
@@ -1206,7 +1205,7 @@ test('M3: distilling a block summary node produces a tier-2 block', async () => 
   assert.equal(after[1]!.kernelBlockId, 'b2', 'the kernel block id is recorded for faithful rehydration')
   assert.ok(after[1]!.effectiveMessageIds!.includes('1'), 'the tier-2 block records its parents ORIGINAL coverage, not the checkpoint node')
 
-  // decompress on the tier-2 block expands through the parent to the originals.
+  // recall on the tier-2 block expands through the parent to the originals.
   const recText = await decompressAll(env, session, after[1]!.blockId)
   assert.match(recText, /tier 2, distills 1 block/)
   assert.match(recText, /\[msg 0\]/)
@@ -1239,7 +1238,7 @@ test('M3: distilling a tier-2 block produces tier 3', async () => {
   assert.deepEqual(after[2]!.parentBlockIds, [ledger2[1]!.blockId])
   assert.equal(after[2]!.kernelBlockId, 'b3')
 
-  // decompress recurses through BOTH levels back to the originals.
+  // recall recurses through BOTH levels back to the originals.
   const recText = await decompressAll(env, session, after[2]!.blockId)
   assert.match(recText, /tier 3, distills 1 block/)
   assert.match(recText, /\[msg 0\]/)
@@ -1322,7 +1321,7 @@ test('M3: compress reports a fully shadowed range as already compressed, no erro
   const text = (result as { text: string }).text
   assert.match(text, /Compressed 0 block/)
   assert.match(text, /already compressed/)
-  assert.match(text, /decompress to recover/)
+  assert.match(text, /recall\(\{ blockId \}\) to recover/)
 
   const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1, 'no phantom block for the stale re-compression')
@@ -1537,7 +1536,7 @@ test('M3: decompress keeps every tool-heavy page under the host pruner threshold
     content: [{ startSeq: 1, endSeq: 14, summary: 'Six large bash tool outputs and their steps: JWT access tokens, Redis refresh tokens, login flow, rate limiting, bcrypt cost 12, session revocation.' }],
   } as never, fakeExec(session))
   const blockId = rebuildBlockLedger(session.snapshotEvents())[0]!.blockId
-  const decompress = toolOf(env, 'decompress')
+  const decompress = toolOf(env, 'recall')
 
   // Walk every page; each one must come back intact under the host pruner threshold.
   let offset = 0

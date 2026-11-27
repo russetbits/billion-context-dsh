@@ -1,12 +1,14 @@
 /**
- * M3 — the four model tools: compress / decompress / search_context /
- * acp_status, registered through `ctx.tools` (defineTool).
+ * M3 — the three model tools: compress / recall / acp_status, registered
+ * through `ctx.tools` (defineTool).
  *
  * compress is the heart of ACP: the model writes the summary and the tool
  * lands it as a durable surface replacement (no second LLM summarization
- * call). decompress recovers shadowed content read-only from the log (DSH
- * keeps the originals — V5). search_context scores blocks rebuilt from the
- * log. acp_status reports the block ledger and pressure.
+ * call). recall is the ONE way back into the log — either a SEARCH over the
+ * block summaries, the shadowed originals and the still-visible surface
+ * (`query`), or a READ of original bytes (`blockId` / `seq`); the two forms
+ * are mutually exclusive, so the model face carries one schema instead of two.
+ * acp_status reports the block ledger and pressure.
  * @module billion-context-dsh/tools
  */
 import { type ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -30,6 +32,12 @@ export interface ToolEnvironment extends KernelConfigInput {
     readonly windowFor?: (agent: Agent) => Promise<AcpWindow>;
     /** Resolved prompt templates (optional: falls back to DEFAULT_RESOLVED). */
     readonly prompts?: ResolvedPrompts;
+    /**
+     * `textOverrides` diagnostics (unknown ids / oversized values). Rendered as one
+     * self-check line in `acp_status` — a composition-row config otherwise has no
+     * visible surface where a typo could show up. Absent = nothing to report.
+     */
+    readonly textWarnings?: readonly string[];
     /** How the model can REACH these tools in the current step (src/ptc.ts). The
      *  engine swaps in the PTC variant of `prompts` together with this, so the two
      *  never disagree; a stand-in env (tests, plain compositions) defaults to
@@ -61,15 +69,15 @@ export declare function resolveEffectiveWindow(env: ToolEnvironment, agent: Agen
 export declare const compressParameters: {
     readonly arguments: {
         readonly type: 'json';
-        readonly description: 'Tolerated wrapped-arguments form (model-generated); unwrapped in handleCompress. Prefer passing content directly.';
+        readonly description: string | undefined;
     };
     readonly topic: {
         readonly type: 'string';
-        readonly description: 'Fallback topic for entries without their own.';
+        readonly description: string | undefined;
     };
     readonly content: {
         readonly type: 'array';
-        readonly description: 'One or more ranges to compress, each with startSeq/endSeq boundaries (surface seqs) and a dense summary. Required — pass it directly, not wrapped in an arguments key.';
+        readonly description: string | undefined;
         readonly items: {
             readonly type: 'object';
             readonly properties: {
@@ -77,37 +85,37 @@ export declare const compressParameters: {
                     readonly required: true;
                     readonly oneOf: readonly [{
                         readonly type: 'integer';
-                        readonly description: 'First surface seq of the range.';
+                        readonly description: string | undefined;
                     }, {
                         readonly type: 'string';
-                        readonly description: 'Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref ("m00306") or a kernel block id ("b1", as acp_status lists) is also accepted — a block id resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation.';
+                        readonly description: string | undefined;
                     }];
                 };
                 readonly endSeq: {
                     readonly required: true;
                     readonly oneOf: readonly [{
                         readonly type: 'integer';
-                        readonly description: 'Inclusive last surface seq of the range.';
+                        readonly description: string | undefined;
                     }, {
                         readonly type: 'string';
-                        readonly description: 'Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 3).';
+                        readonly description: string | undefined;
                     }];
                 };
                 readonly summary: {
                     readonly type: 'string';
                     readonly required: true;
-                    readonly description: 'Complete technical summary replacing the range; keep paths, decisions, values verbatim. Minimum 50 characters.';
+                    readonly description: string | undefined;
                 };
                 readonly topic: {
                     readonly type: 'string';
-                    readonly description: 'Short label (3-5 words) for this range.';
+                    readonly description: string | undefined;
                 };
                 readonly verifiedReadings: {
                     readonly type: 'array';
                     readonly items: {
                         readonly type: 'string';
                     };
-                    readonly description: 'Optional: acceptance readings that are already green before this compression (e.g. "t0-fastpath 8/8", "closedloop 414/414"). Stored structurally on the compaction/summary event and recovered by verifiedReadingsOf, so later steps need not re-run the checks.';
+                    readonly description: string | undefined;
                 };
             };
             readonly additionalProperties: false;
@@ -115,31 +123,31 @@ export declare const compressParameters: {
     };
     readonly force: {
         readonly type: 'boolean';
-        readonly description: 'Override the working-set floor guard on BOTH paths — an explicit content range whose fold leaves less than foldFloorPct of the window visible, and a condense election. Legitimate only for imminent overflow: a shallow working set is where open-weight accuracy collapses (arXiv 2611.05306 Appendix D).';
+        readonly description: string | undefined;
     };
     readonly condense: {
         readonly type: 'object';
-        readonly description: 'Engine-picked fold: the engine elects the LARGEST eligible continuous run of the CURRENT surface (walls: the newest injected instruction copy of every scope, the newest skill catalog, checkpoint carriers, the system node, the active user turn) and folds it in ONE durable replace — you write the handoff note. Mutually exclusive with content. The note must carry "## Goal" (what the stretch was doing and what remains) and "## Next" (the immediate next command plus the completion condition): a note without them turns one fold into a re-run of the work it replaced. Price: the next request re-prefills every token AFTER the rewrite point ONCE, so the rewrite point IS the lever — a fold near the tail barely re-reads anything, one near the head re-reads almost everything. Prefer the LATEST consumed stretch, fold in bulk, and do not fold at all when nothing consumed is worth reclaiming.';
+        readonly description: string;
         readonly properties: {
             readonly summary: {
                 readonly type: 'string';
                 readonly required: true;
-                readonly description: 'The handoff note replacing the elected stretch. Minimum 50 characters; must carry ## Goal and ## Next. Best shape (arXiv 2611.05306 Appendix G): ## Goal, ## Established facts, ## Applied changes, ## Verification (what you ran, what passed, what failed and the workaround), ## Dead ends (tried and why they failed — so nobody retries them), ## Remaining plan with the immediate next command AND the completion condition, carried verbatim. Only Goal/Next are enforced; the rest is checked and named as a warning.';
+                readonly description: string;
             };
             readonly topic: {
                 readonly type: 'string';
-                readonly description: 'Short label (3-5 words) for the folded block.';
+                readonly description: string | undefined;
             };
             readonly force: {
                 readonly type: 'boolean';
-                readonly description: 'Fold even though it leaves less than the working-set floor visible (foldFloorPct of the window). Only for imminent overflow: a shallow working set is where open-weight models lose accuracy.';
+                readonly description: string | undefined;
             };
             readonly verifiedReadings: {
                 readonly type: 'array';
                 readonly items: {
                     readonly type: 'string';
                 };
-                readonly description: 'Optional: acceptance readings already green before this fold (e.g. "t0-fastpath 8/8").';
+                readonly description: string | undefined;
             };
         };
         readonly additionalProperties: false;
@@ -185,6 +193,33 @@ export declare function mnRefIndex(value: string): number | null;
  */
 export declare function guardedRowsInSpan(guarded: ReadonlySet<number>, shadowed: readonly number[]): number[];
 /**
+ * Maximal runs of a shadowed surface slice that contain NO protected row.
+ *
+ * The slice is POSITIONAL (`shadowedSeqsOf`), never a numeric interval: a checkpoint
+ * node carries a seq far higher than its neighbours, so `>=`/`<=` arithmetic would
+ * cut the wrong side (the same reason `guardedRowsInSpan` scans a set). A protected
+ * row at an EDGE simply yields one piece; a span that is nothing but protected rows
+ * yields none, which is the caller's signal to keep the rejection.
+ */
+export declare function splitAroundProtected(shadowed: readonly number[], hits: readonly number[]): number[][];
+/**
+ * Where one surviving piece sits relative to the cut points, in words a reader of
+ * the block can act on: "BEFORE it", "AFTER them", or "between protected rows 2
+ * and 3". Positions come from the POSITIONAL slice, never from seq values.
+ */
+export declare function splitPiecePosition(shadowedSpan: readonly number[], protectedSeqs: readonly number[], piece: readonly number[]): string;
+/**
+ * The mechanical coverage line a CUT block carries above the model's note.
+ *
+ * A split stores the model's note in EVERY piece, and that note was written for the
+ * WHOLE span (seqs `spanStart..spanEnd`). Without this line a later `recall({ blockId })`
+ * reads a note describing content the block does not hold, and — worse — takes it for
+ * the block's complete record while the rest sits in a sibling block. The line makes
+ * both facts explicit, costs one short row, and is used ONLY on cut blocks: a range
+ * with no protected row inside stores the note byte-identically.
+ */
+export declare function splitCoverageLine(index: number, total: number, spanStart: number, spanEnd: number, protectedCount: number, where: string): string;
+/**
  * Advisory note for a plain range that would fold a LIVE block's checkpoint
  * carrier (see `liveCheckpointCarriersInSpan`). Names the block ids the model
  * can use instead — a block-ref boundary is the call that legitimately folds
@@ -217,112 +252,86 @@ export declare function protectedRowRejectionNote(start: number, end: number, hi
  *     caller raises the existing "no assigned ref" error.
  */
 export declare function edgeRefForSeq(session: Session, byRaw: Readonly<Record<string, string>>, seq: number, role: 'start' | 'end', oppositeSeq: number): string | undefined;
-/** One continuous run a condense may fold, priced with the fold-cost column. */
-export interface CondensePick {
+/**
+ * One RANGE a condense submits — NOT one block (redesigned 2026-11-24).
+ *
+ * A prefix fold distils every active block the foldable prefix carries AND folds
+ * the gaps between them in the SAME call, so the elected unit is the prefix, not
+ * the individual block. `start`/`end` are surface seqs of the range's edges;
+ * `endBlock` is the kernel block id when the END edge sits on that block's
+ * checkpoint carrier (a `bN` end makes the kernel DISTIL the block, tier 2/3),
+ * and `carriers` names every active block the range distils.
+ */
+export interface CondenseSpan {
     readonly start: number;
     readonly end: number;
-    readonly count: number;
+    readonly endBlock: string | null;
+    readonly carriers: ReadonlyArray<string>;
     readonly tokens: number;
-    readonly foldCostTokens: number;
-    /** Tokens that stay visible after this fold. */
-    readonly liveAfterFoldTokens: number;
-    /** The elected run would leave less than the working-set floor visible. */
+}
+/** The foldable PREFIX a condense submits, priced as ONE rewrite. */
+export interface CondensePick {
+    /**
+     * The ranges to submit, oldest-first. ONE range carries the whole prefix; a
+     * SECOND, gap-only range appears when the prefix ends on a gap that sits after
+     * the last carrier (`condenseRangesOf` explains why the two cannot merge).
+     */
+    readonly spans: ReadonlyArray<CondenseSpan>;
+    readonly tokens: number;
+    /** Note tokens that stay resident after the fold — one note per submitted range. */
+    readonly noteTokens: number;
+    readonly keptTokens: number;
+    readonly floorTokens: number;
     readonly belowFloor: boolean;
     /**
-     * Whether ANY eligible run (not just the elected one) clears the floor. A
-     * refusal telling the model to fold WIDER when nothing wider is eligible is a
-     * loop generator: every larger span is guarded, so the model gets the
-     * guarded-row refusal back with no third move (cross-review Q3).
+     * Whether ONE eligible row folded ALONE still leaves the floor. A refusal that
+     * tells the model to fold bigger when nothing bigger is eligible is a loop
+     * generator: every wider span is guarded (cross-review Q3).
      */
     readonly aboveFloorAvailable: boolean;
     /**
-     * True when the PAYBACK gate stepped aside because the session is already close to
-     * the window: refusing a fold there does not save the session — the provider rejects
-     * the next request outright, and a costly fold beats a hard failure.
-     */
-    readonly pressureRelief: boolean;
-    /**
-     * The window limit behind `pressureRelief` (0 when no pressure was supplied). The write-time
-     * gate needs it: relief must buy REAL headroom, and what counts as real is window-relative
-     * (round-13 review Q2 — `netSaving > 0` let a 1-token reclaim spend a permanent barrier and a
-     * full re-prefill at ≥85% of the window).
-     */
-    readonly reliefLimitTokens: number;
-    /**
-     * The largest note (stored form, frame prefix included) that still pays back inside
-     * `CONDENSE_PAYBACK_REQUESTS` for the elected span; `Infinity` under pressure relief, where the
-     * horizon stepped aside. The write-time refusal quotes it so a model that over-wrote its note
-     * shortens it to a number that works instead of guessing (round-14 review Q2).
-     */
-    readonly noteBudgetTokens: number;
-    /**
      * How many surface rows the guards refuse (current instruction copies, the
-     * newest skill catalog, checkpoint carriers, the active user turn). A session
-     * that is wide but walled is NOT stuck: telling it to fold wider sends it into
-     * the guard, and telling it to stop compressing hides the fact that the
-     * walls shrink on their own as the session continues (cross-review Q4).
+     * newest skill catalog, the active user turn). A session that is wide but
+     * walled is NOT stuck — telling it to fold wider sends it into the guard
+     * (cross-review Q4).
      */
     readonly guardedRowCount: number;
     /** How many eligible ranges the geometry produced at all (0 = nothing clears the kernel minimum). */
     readonly eligibleRangeCount: number;
-    /**
-     * Set on the synthesized content item of a DEGRADED election. The explicit-range
-     * floor guard reads it instead of a mutable flag, so the two guards share one
-     * decision (cross-review Q2: an ambient bypass is how the elected fold got
-     * re-refused by its own guard).
-     */
-    readonly degraded: boolean;
+    /** Active blocks this fold distils (summed over `spans`). */
+    readonly carrierCount: number;
 }
 export interface CondenseMiss {
     readonly reason: string;
     readonly candidates: SeqCompressibleRange[];
 }
 /**
- * The largest CONTINUOUS eligible run of the current surface, for condense.
+ * The foldable PREFIX of the current surface, for condense.
  *
- * Geometry is the range table’s own (buildCompressibleSeqRanges, rule 3), so a
- * condense can never shadow a row the durable surface forbids: the CURRENT
- * injected copy of every scope, the newest visible skill catalog, checkpoint
- * carriers, the system node and the active user turn are the walls. Superseded
- * injection copies are NOT walls (foldStaleInstructionRows) — the host re-sends a
- * group’s newest row only, so an older AGENTS.md or catalog row folded away stays
- * gone, and that residue is most of what a long session carries.
+ * Geometry is the range table's own (buildCompressibleSeqRanges, rule 3), so a
+ * condense can never shadow a row the durable surface forbids; the timeline adds
+ * the ACTIVE block carriers, which that function deliberately excludes (it
+ * flushes on every checkpoint). The election walks the merged timeline
+ * oldest-first and stops at the first wall — a guarded row (current instruction
+ * copy, newest skill catalog, active user turn) or the working-set floor. It
+ * never SKIPS a wall: a prefix with a hole in it could not be submitted as one
+ * range, which is the whole point of the design.
  *
- * Ranked by NET saving (`tokens − foldCostTokens`), not by volume. Volume was the
- * old rule and it is backwards on a durable surface: compression summary nodes are
- * appended AFTER the rows they replace, so nearly every older row sits in front of a
- * large resident summary block and re-prefills it. Measured 2026-11-15: the volume
- * election removed 23,588 tokens and the very next request re-prefilled 155,927 —
- * about 65 seconds on this engine for a 23.6K-per-request saving.
+ * How long the prefix turns out to be is decided by the guards, not by the block
+ * count: on a real 87-node session (4 carriers on the surface, 41K tokens) the
+ * oldest foldable prefix crossed exactly ONE carrier, because the last real user
+ * turn sat near the front and every later carrier was inside the protected window.
+ * A 50-block synthetic surface (tests/prefix-fold.test.ts P-8) crosses all 50. So
+ * the useful question is never "how many blocks exist" but "how many of them are on
+ * the OLD side of the guards" — `carrierCount` is what the pick reports.
  *
- * The saving IS recurring while the re-prefill is paid ONCE, so a slow payback is still a
- * payback: a row with `foldCost >= tokens` is NOT hard-refused (round-10 review B2), it is an
- * investment that turns positive after foldCost / (tokens − note) further requests. The engine
- * cannot know how many requests are left, so the election REFUSES only when
- * `foldCost > tokens * CONDENSE_PAYBACK_REQUESTS` — beyond the horizon — printing that
- * break-even count and leaving the call to the model through an explicit `content`
- * range (rule 3: the engine never folds by itself). The one genuinely unrecoverable case,
- * `note >= tokens`, is refused at write time by condenseNotePayback below.
+ * What the fold costs is REPORTED (`CondensePick.tokens` against the note), never
+ * an election gate: the engine cannot predict how many requests a session has
+ * left, and a cost model it cannot validate only removes folds a real session
+ * needs. The floor check is `belowWorkingSetFloor` (arXiv 2611.05306 Appendix D),
+ * the note-size check happens at write time (`noteWeightRatio`).
  */
-export declare function pickCondenseSpan(session: Session, turn: ReturnType<CompressionCore['processTurn']>, preserveRecent: number, foldPricing?: FoldPricing,
-/** live billed input and window limit, for the pressure-relief bypass. */
-pressure?: {
-    readonly liveTokens: number;
-    readonly limitTokens: number;
-}): CondensePick | CondenseMiss;
-/**
- * Whether a below-floor condense may still fold. The ONLY compliant reason is
- * that NO eligible row could keep the floor: while one exists, condense must fold
- * that row instead — degrading when a compliant row is available throws away the
- * working set for nothing (round-4 Q1: the barrier-count gate could fire while a
- * 20K row above the floor was still sitting there eligible).
- *
- * The barrier COUNT is not the gate, because it never measured what it claimed:
- * a fold leaves a summary node (a few hundred tokens of note), not a floor-sized
- * hole, so `n folds × floor` is not a debt the window carries. Fragmentation is
- * observable directly in the row set, which needs no new measurement.
- */
-export declare function condenseDegradable(pick: CondensePick, minimum: number): boolean;
+export declare function pickCondenseSpan(session: Session, turn: ReturnType<CompressionCore['processTurn']>, preserveRecent: number, foldPricing?: FoldPricing): CondensePick | CondenseMiss;
 /**
  * Refusal copy for a below-floor condense. The THREE branches ARE the point
  * (cross-review Q4): two-branch copy conflated "nothing wider is above the floor"
@@ -372,6 +381,19 @@ export declare const TYPICAL_HANDOFF_NOTE_TOKENS = 900;
  */
 export declare const MAX_HANDOFF_NOTE_TOKENS = 1500;
 /**
+ * Cut a note down to a token ceiling, keeping whole LINES from the top.
+ *
+ * A note written to the skeleton puts its load-bearing headings first (Task,
+ * Now, then Pointers), so dropping the tail drops narrative — which is exactly
+ * what arXiv 2611.05306 Appendix A says to leave out. Truncating costs nothing;
+ * refusing costs the model a full rewrite, and output tokens are priced well
+ * above cached input.
+ */
+export declare function truncateNoteToCeiling(note: string, maxTokens: number): {
+    note: string;
+    droppedTokens: number;
+};
+/**
  * Smallest stretch condense will elect: the smallest span that can carry a note this host's
  * models actually write inside the weight cap — `TYPICAL_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO`,
  * so a copy or ratio change follows it instead of drifting. The kernel minimum (`minCompressRange`)
@@ -380,82 +402,182 @@ export declare const MAX_HANDOFF_NOTE_TOKENS = 1500;
  */
 export declare const MIN_CONDENSE_SPAN_TOKENS: number;
 /**
- * The smallest handoff note (stored form, frame prefix included) that can still brief a resumed
- * session: the Appendix-G headings plus one line each. The election uses it as the floor of the
- * NOTE BUDGET it solves for, so a span that cannot carry a real briefing inside the payback
- * horizon is refused before the model writes anything (round-14 review Q2/Q5).
- */
-export declare const MIN_HANDOFF_NOTE_TOKENS = 250;
-/**
- * How much net headroom a relief fold must buy, as a fraction of the window. Relief exists to
- * avoid a provider rejection, so a fold that reclaims a few hundred tokens while spending a
- * permanent barrier and a full re-prefill does not relieve anything — it just re-arms the same
- * cliff one step later (round-13 review Q2: cliff thrashing). Window-relative for the same
- * reason the emergency minimum is: a hard constant silently disables relief on a small window.
- */
-export declare const RELIEF_MIN_NET_SAVING_RATIO = 0.02;
-/**
- * The net reclaim relief still demands (0 outside relief). Exported so the arithmetic is
- * testable without engineering a session whose pressure, suffix and note all line up.
- */
-/**
- * Cap on the relief floor, deliberately NOT `MIN_DEGRADED_FOLD_TOKENS`. That constant is a GROSS
- * span-size floor (`pick.tokens >= minimum`), while `reliefMinSavingTokens` gates a NET reclaim
- * (`span − note`); sharing one value meant a net-reclaim floor of 4096 forced a ~6.3K-token span
- * whenever the model wrote a 35% note, and any change to one silently moved the other
- * (round-14 review Q3).
- */
-export declare const RELIEF_MIN_NET_SAVING_MAX_TOKENS = 2048;
-export declare function reliefMinSavingTokens(pressureRelief: boolean, limitTokens: number): number;
-/** How many further requests a condense must pay back inside to be worth electing. */
-export declare const CONDENSE_PAYBACK_REQUESTS = 4;
-/**
- * The largest note (stored form, frame prefix included) that still pays back inside the horizon:
- * `foldCost + note <= N × (tokens − note)`  ⇒  `note <= (N × tokens − foldCost) / (N + 1)`.
- * Exported so the arithmetic is testable without engineering a fixture whose span, suffix and
- * note all line up (round-14 review Q2 replaced the worst-case-note price with this).
- */
-export declare function condenseNoteBudget(spanTokens: number, foldCostTokens: number): number;
-/**
- * Whether a relief span can reach the relief floor at all — with the smallest note this tool
- * accepts (the bare summary frame prefix). Exported for the same reason (round-14 review Q3).
- */
-export declare function reliefSpanReachable(spanTokens: number, limitTokens: number): boolean;
-/**
- * Pressure at which the payback gate steps aside (live billed input ÷ window).
- * Below it a poor-payback fold is a choice; at or above it, NOT folding is the
- * riskier option because the next request can be rejected by the provider.
- */
-export declare const CONDENSE_PRESSURE_RELIEF_RATIO = 0.85;
-/**
- * Is this condense worth running once the note is counted? The folded volume is the saving
- * side, but the note stays resident on EVERY later request, so the honest saving is
- * `span − note`, and the one-time cost is the re-prefill. Exported so the arithmetic is
- * testable without engineering a fixture whose stretch, suffix and note all line up.
- */
-export declare function condenseNotePayback(spanTokens: number, foldCostTokens: number, noteTokens: number): {
-    readonly worth: boolean;
-    readonly payback: number;
-    readonly netSaving: number;
-};
-/**
- * Note weight, priced as the note is STORED. Two gates read this number — the weight cap here
- * and the payback re-pricing in `handleCompress` — and they must not disagree: measuring the
- * raw note here while pricing the stored node there let a note just under 35% raw exceed 35%
- * once the frame prefix (and the degrade stamp) landed (round-13 review Q1).
- * `storedTokens` lets a caller that already counted the stored form pass it in.
+ * Note weight, priced as the note is STORED: the summary frame prefix the checkpoint node
+ * carries is part of what stays resident, so the ratio must count it or a note just under 35%
+ * raw would exceed 35% once stored (round-13 review Q1). `storedTokens` lets a caller that
+ * already counted the stored form pass it in instead of counting twice.
  */
 export declare function noteWeightRatio(note: string, spanTokens: number, storedTokens?: number): number;
-export declare function noteWeightRejection(note: string, spanTokens: number, storedTokens?: number, includesDegradeLine?: boolean): string;
+export declare function noteWeightRejection(note: string, spanTokens: number, storedTokens?: number): string;
 /**
  * Build the unified SearchDoc[] from the log: one block doc per ledger entry
- * (ref = compactionId, so `decompress({ blockId })` closes the loop) plus one
+ * (ref = compactionId, so `recall({ blockId })` closes the loop) plus one
  * message doc per shadowed ORIGINAL (expanded through distilled parents; each
  * seq is claimed by the earliest/innermost block that covered it, mirroring
- * pi's owner map — decompress on that block recovers the original).
+ * pi's owner map — recall on that block recovers the original).
  * Cached per log snapshot (see searchDocsCache). Exported for the issue #133
  * regression tests (not part of the public API — index.ts re-exports only).
  */
 export declare function buildSearchDocs(session: Session): SearchDoc[];
-/** Build the four ACP model tools bound to one engine. */
+/**
+ * The compress parameter sheet with the model-facing copy replaced by the
+ * RESOLVED text. Returns the shared constant object untouched (same reference)
+ * when nothing was overridden, so the default path allocates nothing and
+ * `tests/g5-governance.test.ts` keeps reading the shipped sheet.
+ *
+ * Two layers ride here: the TOOL-level `condense` description (`tool.condense`)
+ * and the 14 PARAMETER-level texts (`tool.param.compress.*`).
+ */
+export declare function compressParametersFor(prompts: ResolvedPrompts): {
+    readonly arguments: {
+        readonly type: 'json';
+        readonly description: string | undefined;
+    };
+    readonly topic: {
+        readonly type: 'string';
+        readonly description: string | undefined;
+    };
+    readonly content: {
+        readonly type: 'array';
+        readonly description: string | undefined;
+        readonly items: {
+            readonly type: 'object';
+            readonly properties: {
+                readonly startSeq: {
+                    readonly required: true;
+                    readonly oneOf: readonly [{
+                        readonly type: 'integer';
+                        readonly description: string | undefined;
+                    }, {
+                        readonly type: 'string';
+                        readonly description: string | undefined;
+                    }];
+                };
+                readonly endSeq: {
+                    readonly required: true;
+                    readonly oneOf: readonly [{
+                        readonly type: 'integer';
+                        readonly description: string | undefined;
+                    }, {
+                        readonly type: 'string';
+                        readonly description: string | undefined;
+                    }];
+                };
+                readonly summary: {
+                    readonly type: 'string';
+                    readonly required: true;
+                    readonly description: string | undefined;
+                };
+                readonly topic: {
+                    readonly type: 'string';
+                    readonly description: string | undefined;
+                };
+                readonly verifiedReadings: {
+                    readonly type: 'array';
+                    readonly items: {
+                        readonly type: 'string';
+                    };
+                    readonly description: string | undefined;
+                };
+            };
+            readonly additionalProperties: false;
+        };
+    };
+    readonly force: {
+        readonly type: 'boolean';
+        readonly description: string | undefined;
+    };
+    readonly condense: {
+        readonly type: 'object';
+        readonly description: string;
+        readonly properties: {
+            readonly summary: {
+                readonly type: 'string';
+                readonly required: true;
+                readonly description: string;
+            };
+            readonly topic: {
+                readonly type: 'string';
+                readonly description: string | undefined;
+            };
+            readonly force: {
+                readonly type: 'boolean';
+                readonly description: string | undefined;
+            };
+            readonly verifiedReadings: {
+                readonly type: 'array';
+                readonly items: {
+                    readonly type: 'string';
+                };
+                readonly description: string | undefined;
+            };
+        };
+        readonly additionalProperties: false;
+    };
+};
+/** `recall` 的 7 个参数文案(`tool.param.recall.*`)。 */
+export declare function recallParametersFor(prompts: ResolvedPrompts): {
+    readonly query: {
+        readonly type: 'string';
+        readonly description: string | undefined;
+    };
+    readonly blockId: {
+        readonly type: 'string';
+        readonly description: string | undefined;
+    };
+    readonly seq: {
+        readonly type: 'integer';
+        readonly description: string | undefined;
+    };
+    readonly chars: {
+        readonly type: 'integer';
+        readonly description: string | undefined;
+    };
+    readonly maxResults: {
+        readonly type: 'integer';
+        readonly description: string | undefined;
+    };
+    readonly offset: {
+        readonly type: 'integer';
+        readonly description: string | undefined;
+    };
+    readonly pageLimit: {
+        readonly type: 'integer';
+        readonly description: string | undefined;
+    };
+};
+/** `acp_status` 的 4 个参数文案(`tool.param.acpStatus.*`)。 */
+export declare function statusParametersFor(prompts: ResolvedPrompts): {
+    detail: {
+        type: 'string';
+        enum: readonly ['overview', 'compressed', 'visible', 'messages'];
+        description: string | undefined;
+    };
+    tool: {
+        type: 'string';
+        description: string | undefined;
+    };
+    sort: {
+        type: 'string';
+        enum: readonly ['size', 'time', 'tool', 'age'];
+        description: string | undefined;
+    };
+    limit: {
+        type: 'integer';
+        description: string | undefined;
+    };
+};
+/**
+ * Build the three ACP model tools bound to one engine.
+ *
+ * The four MAIN tools are `textOverrides`-addressable today: `compress`/`recall`/
+ * `acp_status` through `prompts.tools.*` and the compress sheet's `condense`
+ * parameter through `compressesParametersFor` above. TODO(textOverrides): the
+ * remaining ~26 parameter `description` strings (compress content items, force,
+ * verifiedReadings, recall's query/blockId/seq/chars/maxResults/offset/pageLimit,
+ * acp_status's detail/tool/sort/limit) are still hard-coded — wiring them means
+ * turning `compressParameters`/`recallParameters`/`statusParameters` into
+ * prompt-derived builders, which collides with the in-flight content-path work in
+ * this file; left as a deliberate follow-up rather than a half-migration.
+ */
 export declare function makeTools(env: ToolEnvironment): ToolDefinition[];

@@ -112,8 +112,10 @@ test('M4/prompts 2: default normal nudge — efficiency note + tip, guidance mov
   assert.ok(!text.includes('KEEP VERBATIM'), 'KEEP VERBATIM 不在 nudge（B6）')
   // No "suggestion, not a requirement"
   assert.ok(!text.includes('suggestion, not a requirement'), 'no "suggestion, not a requirement"')
-  // Tip at end (kernel 0.0.101 copy: the batch fold is ONE call, array OR plain-string form)
-  assert.ok(text.endsWith('💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (`content: [{...}, {...}]`) or ONE plain string holding every range, each block starting with its \'mNNNNN–mNNNNN topic\' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.'), 'tip at end')
+  // Tip at end (M-3: the ENGINE tip replaces the kernel one — the kernel copy
+  // advertised a plain-string content form this schema rejects, and the merged
+  // tip carries the two-shapes contract in one line).
+  assert.ok(text.endsWith('💡 One call is enough: compress({ condense: { summary } }) lets the engine pick the span (folds the OLDEST consumed PREFIX, every fold barrier inside it merges into ONE block), and compress({ content: [{ startSeq, endSeq, summary }, …] }) batches explicit ranges — content must be an ARRAY (a plain-string content is rejected).'), 'engine tip at end')
 })
 
 test('M4/prompts 2b: default nudge renders through the kernel renderNudgeText path (seq table replaces ref table)', () => {
@@ -125,7 +127,7 @@ test('M4/prompts 2b: default nudge renders through the kernel renderNudgeText pa
   // Kernel frame + tip verbatim；B6 起哲学/规则段被摘掉（改住系统提示）
   assert.ok(text.startsWith('This is an efficiency nudge to compress early and keep context lean — not an overflow warning.'), 'kernel EFFICIENCY_NOTE frame')
   assert.ok(!text.includes('HOW TO COMPRESS'), 'B6：规则段不在 nudge')
-  assert.ok(text.endsWith('💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (`content: [{...}, {...}]`) or ONE plain string holding every range, each block starting with its \'mNNNNN–mNNNNN topic\' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.'), 'kernel batch tip at end')
+  assert.ok(text.endsWith('💡 One call is enough: compress({ condense: { summary } }) lets the engine pick the span (folds the OLDEST consumed PREFIX, every fold barrier inside it merges into ONE block), and compress({ content: [{ startSeq, endSeq, summary }, …] }) batches explicit ranges — content must be an ARRAY (a plain-string content is rejected).'), 'engine batch tip at end')
   // Ref-ID rangesStr replaced by the surface-seq table. The title KEEPS the
   // kernel header format ("N, oldest first") with the seq dialect appended —
   // the kernel mN range rows are what must be gone.
@@ -138,27 +140,24 @@ test('M4/prompts 2b: default nudge renders through the kernel renderNudgeText pa
   assert.ok(!text.includes('Context usage is at'), 'no usage statement')
 })
 
-test('M4/prompts 2c: nudge states the array-only content form before the tip (0.0.101 tip advertises a plain string)', () => {
-  // The kernel's 0.0.101 batch tip offers BOTH the array form and a plain
-  // string. Our `compress` schema takes the array form only, so the engine
-  // appends one line saying so. Pinned against REAL rendered output (literal
-  // substrings, not the constant we inject), on BOTH prompt paths, and the
-  // kernel tip must stay the closing line.
+test('M4/prompts 2c (M-3): the tip carries the two-shapes contract — the standalone Note segment is gone', () => {
+  // M-3 merged the Note and 💡 segments (they repeated the same contract): the
+  // tip now carries both shapes AND the array requirement in ONE line, so the
+  // tail is one line instead of two overlapping ones. Pinned against REAL
+  // rendered output on both prompt paths; the tip stays the closing line.
   const session = buildTextSession(12)
   const kernelPath = buildNudgeText(fakeDecision(50, false), false, session, wholeSurfaceRangeView(session))
-  assert.ok(kernelPath.includes('this tool takes the array form only'), 'kernel path carries the array-form note')
-  assert.ok(kernelPath.includes('compress({ content: [{ startSeq, endSeq, summary }] })'), 'the note spells out the accepted shape')
-  assert.ok(
-    kernelPath.indexOf('this tool takes the array form only') < kernelPath.indexOf('💡 If you compress'),
-    'the note sits before the tip',
-  )
-  assert.ok(kernelPath.endsWith('later nudges.'), 'the kernel tip still closes the nudge')
+  assert.ok(kernelPath.includes('lets the engine pick the span'), 'the condense shape is spelled out')
+  assert.ok(kernelPath.includes('content must be an ARRAY'), 'the array requirement survives in the tip')
+  assert.ok(kernelPath.includes('batches explicit ranges'), 'the content shape is still spelled out')
+  assert.ok(!kernelPath.includes('two shapes work'), 'the standalone Note segment is gone (M-3)')
+  assert.ok(kernelPath.includes('💡'), 'a tip still closes the nudge')
 
   const templatePath = buildNudgeText(
     fakeDecision(50, false), false, session, wholeSurfaceRangeView(session),
     resolvePrompts({ nudge: { tip: '自定义尾注' } }),
   )
-  assert.ok(templatePath.includes('this tool takes the array form only'), 'template path carries the note too')
+  assert.ok(templatePath.includes('自定义尾注'), 'host tip replaces the contract line it owns')
   assert.ok(templatePath.endsWith('自定义尾注'), 'host tip still closes the nudge')
 })
 
@@ -186,21 +185,32 @@ test('M4/prompts 4: range table snapshot (with ranges) and zero-range early retu
     rangeTable(paged, wholeSurfaceRangeView(paged)),
     `
 Surface: 12 nodes, seqs 1..12
-Ranges (1, oldest first; seqs usable as-is):
-  - seq 1..7 · 7msg ~7227t tool0% · fold ~5164
-fold = re-prefilling every token AFTER the rewrite point, paid ONCE (the fixed request head sits before every rewrite point, so a warm cache reuses it; an injected row that landed AFTER the rewrite point is inside this price); batch rows into ONE call and prefer the LATEST consumed rows (an earlier rewrite point re-reads more). compress({ content: [{ startSeq, endSeq, summary }] }); stale seqs mean re-run acp_status. A row marked N spilled has its bytes on a FILE, still readable from disk, so folding it loses nothing. A row marked below floor strands the working set — fold a row that STILL LEAVES the floor, or read from files. Only fold spans you have fully consumed: carry their open TODOs and artifact paths into the summary, or leave them live.`
+Ranges (1, cheapest rewrite point first — condense always folds the OLDEST eligible prefix, so write your note for that stretch):
+  - seq 1..7 · 7msg ~7227t tool0% · fold ~5164 · payback 0.7
+Best batch here: 1 row(s) in ONE call → ~7227t less on every later request, one re-prefill of ~5164t — pays back in 0.7 req. The fold column prices each row ALONE; the batch pays one re-prefill for all of them.
+fold = re-prefilling every token AFTER the rewrite point, paid ONCE; batch rows into ONE call. DEFAULT MOVE: compress({ condense: { summary } }) — the engine folds the oldest eligible prefix and merges every barrier inside it into ONE block, so you never hand-assemble boundaries.
+Use compress({ content: [{ startSeq, endSeq, summary }] }) only for an exact span or several disjoint ones; stale seqs mean re-run acp_status. A row marked N spilled has its bytes on a FILE — folding it loses nothing; a row marked below floor strands the working set — fold a row that STILL LEAVES the floor. Only fold spans you have fully consumed: carry their open TODOs and artifact paths into the summary, or leave them live.`
   )
 })
+
+/**
+ * 语义载体断言：或为自然语言原话，或为该语义点的专属结构化键行（`key: value`）。
+ * 用户 2026-11-25 定：测试保护的是**语义**，不是措辞 —— 精简/结构化改写不该
+ * 迫使测试跟着改，但语义消失必须红。每个键只对应一个语义点，避免退化成永真。
+ */
+function carriesSemantic(text: string, naturalPhrase: string, structuredKey: string): boolean {
+  if (text.includes(naturalPhrase)) return true
+  return new RegExp(`(^|\\n)\\s*${structuredKey}\\s*:`, 'i').test(text)
+}
 
 test('M4/prompts 5: tool descriptions render the defaults byte-identical', () => {
   const descriptions = Object.fromEntries(makeTools(makeEnv(128000)).map((t) => [t.name, t.description]))
   assert.equal(
     descriptions['compress'],
-    'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated ranges in one call (each content entry becomes its own block); keep ranges disjoint. Never compress content the current step is actively using. Compress boundaries are SURFACE SEQS (acp_status Surface: row, latest nudge table). The block refs (bN, e.g. b1) that acp_status COMPRESSED BLOCKS shows are ALSO valid boundaries — naming the checkpoint node of a block is exactly how you DISTILL that block (tier 2/3); decompress takes the same bN. Drilldown mN refs (e.g. m00306) are ALSO accepted as startSeq/endSeq — they are auto-mapped to the live surface seq; an unknown mN (never assigned on the current surface) fails with guidance. Seq refs must come from the CURRENT surface (acp_status or the latest nudge): a span whose edges were shadowed by an earlier compress is auto-remapped to its still-live content, a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration — when the details are consumed and no longer critical for the task ahead. Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live. When you write a summary, turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) — not a blow-by-blow; and keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original. Optional verifiedReadings: string[] per content entry records acceptance readings that are already green (e.g. "t0-fastpath 8/8") — stored structurally on the compaction event so later steps need not re-run them. Engine-picked fold: compress({ condense: { summary } }) lets the engine elect the LARGEST eligible continuous run of the current surface and fold it in ONE replace while you write the handoff note — that note must carry ## Goal and ## Next. A fold makes the next request re-prefill every token AFTER the rewrite point ONCE, so the rewrite point IS the lever: prefer the LATEST consumed stretch and batch consumed spans into one call rather than folding small spans repeatedly.',
+    'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference.\ndisplay: condense (DEFAULT — engine elects the cheapest eligible shape, possibly a multi-span batch, you name no boundary) | content (EXPLICIT — you name the spans)\ncondense: compress({ condense: { summary } }) folds the cheapest eligible shape of the CURRENT surface (possibly a multi-span batch across walls) in ONE replace; the note is a brief for the work AHEAD (NVIDIA App. A four-field shape, 150-400 tokens — not a narrative of what happened):\n  ## Task (verbatim/near-verbatim copy of the task this stretch served — REQUIRED) ## Now (current work + intent + next step, done when <criterion> — REQUIRED) ## Plan (decomposition + completion criteria) ## Pointers (artifact paths/seq/blockId — keep credentials and exact values verbatim)\n  judgment: fold what is consumed, keep what is still in use; never summarize narrative process\ncontent: compress({ content: [{ startSeq, endSeq, summary, topic?, verifiedReadings? }] }) — batch disjoint ranges in ONE call (each entry its own block; one re-prefill for the batch); boundaries = surface seqs (acp_status or nudge table), bN, or mN\nverifiedReadings: readings that came back green and a later step depends on (e.g. ["closedloop 414/414"]) — stored on the block, so a resumed session does not re-run the suite\nnever: content the current step is still using\nmoments: stage or subtask completion | strategy switch | intermediate milestone | winding up failed exploration\nconsumed: only fold a moment whose details you have fully consumed and will not re-check\nre-verify: before folding, ask — will I need any detail from this range again in this task? If yes, keep it live\ndead-end: turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) — never a blow-by-blow\nonly-record: the summary is the ONLY record a later reader has — self-contained, so a reader (or you, after a recall) can continue without the original; keep paths and values verbatim\ncost: a fold re-prefills every token AFTER the rewrite point ONCE → prefer the LATEST consumed stretch, batch what you would fold anyway, do not fold small spans repeatedly\nreject: a rejected call names exactly what to change — read it instead of guessing.',
   )
-  assert.equal(descriptions['decompress'], 'Recover the original content of a compressed block by its blockId — the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id from search_context (read-only; does not unshadow the range). Large blocks are paged so each page stays under the host tool-result trim budget (up to 100 messages per call): pass offset/limit to walk them and follow the continue hint in the result. Pass the narrowest page that answers the question (offset/limit) and locate the part you need with search_context first — a full dump re-pays every byte the fold removed.')
-  assert.equal(descriptions['search_context'], 'Search inside compressed blocks (summaries and original content) for information the model no longer sees in context. When a summary lacks a detail you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST — never guess or reconstruct from memory: search_context(query) locates the right block, then decompress only that block to recover the original.')
-  assert.equal(descriptions['acp_status'], 'Context status: overview of the current context — CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) work in BOTH tools — decompress reads the block, and compress accepts bN as a boundary to DISTILL that block (tier 2/3); plain spans use the Surface: seq range. Drilldown: pass scope:"compressed" for a per-block list, or scope:"uncompressed" with view:"messages" (every visible message) / view:"ranges" (merged ranges); tool filters to one tool name, sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) — feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN also works as a compress boundary (it distills that block), Surface: seqs cover plain spans.')
+  assert.equal(descriptions['recall'], 'Recall content the visible context no longer carries — ONE tool, two mutually exclusive forms. SEARCH: recall({ query: "CONTEXT_WINDOW_EXCEEDED" }) scores the compressed-block summaries, the folded originals AND the still-visible surface, and prints one ref per hit (block bN, a still-visible seq, or the block that owns a folded seq) — when a summary lacks a detail you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST — never guess or reconstruct from memory, then read only that block to recover the original. READ: recall({ blockId: "b1" }) dumps a block\'s original messages read-only (the bN ref acp_status lists, or a compaction id / prefix from a search hit; large blocks page — pass offset/pageLimit and follow the continue hint, and locate the page you need with a query first), and recall({ seq: 42 }) returns ONE event\'s original text (pass chars to read past the 20000-char cut; works after a fold because the log keeps the bytes). One call is one form: query + blockId/seq in the same call is refused. Examples: recall({ query: "AUTH_TOKEN_TTL" }) · recall({ blockId: "b1", offset: 0, pageLimit: 50 }).')
+  assert.equal(descriptions['acp_status'], 'Context status: overview of the current context — CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) work in BOTH tools — recall({ blockId: "bN" }) reads the block, and compress accepts bN as a boundary to DISTILL that block (tier 2/3); plain spans use the Surface: seq range. Drilldown: detail:"compressed" for the per-block list, detail:"visible" for the merged foldable ranges, detail:"messages" for every visible message; no detail = overview. tool narrows to one tool name (detail:"messages" only), sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) — feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN also works as a compress boundary (it distills that block), Surface: seqs cover plain spans.')
 })
 
 test('M4/prompts 5b: default compress description ships the #43 semantic-timing and actionable-summary guidance', () => {
@@ -213,36 +223,36 @@ test('M4/prompts 5b: default compress description ships the #43 semantic-timing 
   const descriptions = Object.fromEntries(makeTools(makeEnv(128000)).map((t) => [t.name, t.description]))
   const compress = descriptions['compress']
   assert.ok(
-    compress.includes('Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration'),
+    carriesSemantic(compress, 'Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration', 'moments'),
     'semantic compression moments present (issue #43)',
   )
   assert.ok(
-    compress.includes('turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) — not a blow-by-blow'),
+    carriesSemantic(compress, 'turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) — not a blow-by-blow', 'dead-end'),
     'actionable dead-end→conclusion rule present (issue #43)',
   )
   assert.ok(
-    compress.includes('keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original'),
+    carriesSemantic(compress, 'keep the summary the ONLY record: self-contained, so a later reader (or you, after a recall) can continue without the original', 'only-record'),
     'summary-as-only-record rule present (issue #43)',
   )
 })
 
-test('M4/prompts 5c: search-first carriers ship in the default search_context description AND the system prompt quick-reference (issue #44)', () => {
+test('M4/prompts 5c: search-first carriers ship in the default recall description AND the system prompt quick-reference (issue #44)', () => {
   // issue #44: when a summary lacks details, the model must SEARCH the
   // compressed blocks first — never guess or reconstruct from memory.
   // Two independent entry points carry the rule: (a) the default
-  // search_context TOOL description and (b) the system-prompt
+  // recall TOOL description and (b) the system-prompt
   // quick-reference line. Pinning both as semantic carriers (not
   // byte-identical — that is test #5) guards against either drifting back
   // to the old passive wording independently.
   const descriptions = Object.fromEntries(makeTools(makeEnv(128000)).map((t) => [t.name, t.description]))
-  const searchCtxDesc = descriptions['search_context']
+  const recallDesc = descriptions['recall']
   assert.ok(
-    searchCtxDesc.includes('SEARCH the compressed blocks FIRST — never guess or reconstruct from memory'),
-    'search-first rule present in the default search_context description (issue #44)',
+    recallDesc.includes('SEARCH the compressed blocks FIRST — never guess or reconstruct from memory'),
+    'search-first rule present in the default recall description (issue #44)',
   )
   assert.ok(
-    searchCtxDesc.includes('then decompress only that block to recover the original'),
-    'decompress-locates-then-recovers step present (issue #44)',
+    recallDesc.includes('then read only that block to recover the original'),
+    'search-locates-then-reads step present (issue #44)',
   )
   const rendered = renderSystemPrompt(resolvePrompts())
   assert.ok(
@@ -267,11 +277,11 @@ test('M4/prompts 5d: anti-over-compression carriers ship in the default compress
   const descriptions = Object.fromEntries(makeTools(makeEnv(128000)).map((t) => [t.name, t.description]))
   const compress = descriptions['compress']
   assert.ok(
-    compress.includes('stage or subtask completion whose details you have fully consumed and will not re-check'),
+    carriesSemantic(compress, 'stage or subtask completion whose details you have fully consumed and will not re-check', 'consumed'),
     'consumed-qualifier on subtask completion present (issue #55)',
   )
   assert.ok(
-    compress.includes('Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live.'),
+    carriesSemantic(compress, 'Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live.', 're-verify'),
     're-verify self-check present (issue #55)',
   )
   const rendered = renderSystemPrompt(resolvePrompts())
@@ -280,7 +290,7 @@ test('M4/prompts 5d: anti-over-compression carriers ship in the default compress
     'cite-verbatim WHEN NOT bullet present in system prompt (issue #55)',
   )
   assert.ok(
-    rendered.includes('decompress costs a full round-trip; prefer delaying the compress'),
+    rendered.includes('a recall costs a full round-trip; prefer delaying the compress'),
     'round-trip cost warning present in system prompt (issue #55)',
   )
 })
@@ -312,6 +322,40 @@ test('M4/prompts 5e: liveness-aware compression carriers ship in the range-table
     table.includes('open TODOs and artifact paths'),
     'footer names ruled-out paths + artifact locations (issue #149)',
   )
+})
+
+test('M4/P0-3: Appendix-A note doctrine ships in the compress description, condense description AND the system prompt', () => {
+  // paper-alignment §4 P0-3 (2026-11-25): the controlled experiment (§8.2) attributes
+  // -62% re-retrieval to doctrine alone, and NVIDIA Appendix A defines what a good
+  // note IS — a brief for the work ahead (Task verbatim / Now / Plan+done-when /
+  // Pointers with verbatim credentials), never a narrative of what happened, and
+  // SHORT (the paper's median is 185t; our TYPICAL_HANDOFF_NOTE_TOKENS is 400).
+  // Three engine-owned carriers must all say it: the compress tool description
+  // (point of call), the condense param description, and the system prompt CONDENSE
+  // section (one-time guidance). Kernel copy (HOW_TO_COMPRESS_RULES, rule 9) is
+  // upstream — this pins only OUR layers.
+  const descriptions = Object.fromEntries(makeTools(makeEnv(128000)).map((t) => [t.name, t.description]))
+  const compress = descriptions['compress']
+  assert.ok(
+    compress.includes('brief for the work AHEAD') && compress.includes('not a narrative of what happened'),
+    'compress description frames the note as a forward brief (Appendix A)',
+  )
+  assert.ok(compress.includes('## Task') && compress.includes('REQUIRED'), 'Task named REQUIRED')
+  assert.ok(compress.includes('## Plan') && compress.includes('## Pointers'), 'Plan and Pointers named')
+  assert.ok(compress.includes('150-400 tokens'), 'the short-note budget is stated')
+  assert.ok(compress.includes('fold what is consumed, keep what is still in use'), 'the consumed-vs-live judgment line')
+  const compressTool = makeTools(makeEnv(128000)).find((t) => t.name === 'compress')
+  const condenseCopy = String((compressTool!.parameters as { properties: { condense?: { description?: string } } }).properties.condense?.description ?? '')
+  assert.ok(condenseCopy.includes('BRIEF FOR THE WORK AHEAD'), 'the condense parameter description ships the Appendix-A frame')
+  assert.ok(condenseCopy.includes('## Task') && condenseCopy.includes('## Pointers'), 'condense description carries the same four-field shape')
+  assert.ok(condenseCopy.includes('150-400'), 'condense description states the short budget')
+  const rendered = renderSystemPrompt(resolvePrompts())
+  assert.ok(rendered.includes('fold what is consumed, keep what is still in use'), 'the judgment line lives in the system prompt')
+  assert.ok(rendered.includes('NOT a narrative'), 'the anti-narrative rule lives in the system prompt')
+  assert.ok(rendered.includes('150-400 tokens'), 'the short-note budget lives in the system prompt')
+  assert.ok(rendered.includes('verbatim or near-verbatim copy of the task'), 'Task is near-verbatim in the system prompt')
+  assert.ok(rendered.includes('completion criterion (when is it DONE)'), 'the Plan completion criterion lives in the system prompt')
+  assert.ok(rendered.includes('credentials and exact values verbatim'), 'Pointers carry verbatim credentials')
 })
 
 test('M4/prompts 6: partial overrides merge per key; key/group null falls back to default', () => {
@@ -434,7 +478,7 @@ test('M4/prompts 13: Chinese override smoke (i18n scenario)', () => {
       line: '  - seq {start}..{end} — {count} 条消息,约 {tokens} tokens',
       footer: '用 compress 压缩;批量条目各成一个块。',
     },
-    systemPrompt: '主动上下文剪枝 —— 模型驱动。\n{philosophy}\n{howToCompressRules}\n压缩工具:compress/decompress/search_context/acp_status。',
+    systemPrompt: '主动上下文剪枝 —— 模型驱动。\n{philosophy}\n{howToCompressRules}\n压缩工具:compress/recall/acp_status。',
   })
   const session = buildTextSession(12)
   const text = buildNudgeText(fakeDecision(7, false), false, session, wholeSurfaceRangeView(session), prompts)
@@ -447,7 +491,7 @@ test('M4/prompts 13: Chinese override smoke (i18n scenario)', () => {
   const sys = renderSystemPrompt(prompts)
   assert.ok(sys.includes('主动上下文剪枝'))
   assert.ok(sys.includes('Compression Philosophy:'))
-  assert.ok(sys.includes('compress/decompress/search_context/acp_status'))
+  assert.ok(sys.includes('compress/recall/acp_status'))
 })
 
 test('M4/prompts 14: engine-level — config.prompts reaches system prompt section, tool descriptions, and the pre-step nudge', async () => {

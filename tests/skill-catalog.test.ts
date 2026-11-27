@@ -168,26 +168,23 @@ test('#185: handleCompress rejects a span covering the current catalog; a supers
   const exec = { callId: 'call-acp', name: 'compress', arguments: {}, signal: new AbortController().signal, agent } as never
   const summary = 'Authentication system: JWT access tokens with 15 minute expiry, refresh tokens in Redis with 30 day TTL, login flow in src/auth/login.ts with sliding-window rate limiting at 10 requests per minute.'
 
-  // A span covering the CURRENT catalog (seq 6) is rejected before the kernel
-  // sees it: nothing durable lands, the seq is named, and the reason names the
-  // catalog channel specifically (it is never re-sent — unlike AGENTS.md).
+  // Since 2026-11-25 a span covering the CURRENT catalog (seq 6) is CUT AROUND it:
+  // the catalog row is never folded (it is never re-sent — unlike AGENTS.md), the
+  // older side lands, and the model needs no second call.
   const rejected = await compress.execute({ content: [{ startSeq: 1, endSeq: 7, summary }] } as never, exec)
   const rejectedText = (rejected as { text: string }).text
-  assert.match(rejectedText, /Compressed 0 block/)
-  assert.match(rejectedText, /seqs \d+\.\.\d+ rejected/)
-  assert.match(rejectedText, /seq 6/, 'the current catalog row is named')
-  assert.match(rejectedText, /never re-sent|catalog digest/, 'the rejection explains WHY a catalog differs from AGENTS.md')
-  assert.match(rejectedText, /stale copies/, 'the model is pointed at the stale-copy escape')
+  assert.match(rejectedText, /Compressed 1 block\(s\) from 1 range \(split around [12] protected lines?\)/)
+  assert.ok(session.surface.nodes.includes(6 as never), 'the CURRENT catalog row stays visible')
   assert.ok(
-    !sessionEventsOf(session).some((event) => String((event as { type?: string }).type).startsWith('compaction')),
-    'nothing durable landed — the kernel never saw the rejected span',
+    sessionEventsOf(session).some((event) => String((event as { type?: string }).type).startsWith('compaction')),
+    'the surviving side landed — the cut is executed in THIS call',
   )
 
   // The SUPERSEDED catalog (seq 3) is the legitimate cleanup: compressing it
   // while the newest stays visible triggers no resend and must succeed.
   const accepted = await compress.execute({ content: [{ startSeq: 1, endSeq: 5, summary }] } as never, exec)
   const acceptedText = (accepted as { text: string }).text
-  assert.match(acceptedText, /Compressed 1 block/, 'a span covering only the stale catalog lands')
+  assert.match(acceptedText, /already compressed/, 'the cut above already folded the side holding the stale catalog')
   assert.ok(
     sessionEventsOf(session).some((event) => String((event as { type?: string }).type) === 'compaction/summary'),
     'the accepted compression wrote its durable summary event',

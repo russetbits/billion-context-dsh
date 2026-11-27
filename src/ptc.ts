@@ -66,7 +66,7 @@ export function detectPtcMode(texts: Iterable<string>): boolean {
  * inside their braces (`{ blockId }`, not `{blockId}`) or the render throws.
  */
 export const PTC_SYSTEM_LINE =
-  'Calling convention in this session (PTC / code mode): `run_code` is the only directly callable tool — reach the ACP tools from inside a `run_code` program (`await tools.compress({ content: [...] })`, `await tools.acp_status({})`, `await tools.decompress({ blockId })`, `await tools.search_context({ query })`). A direct call naming them produces no call and no error — it silently emits text. Build summary strings from single-quoted lines joined by a newline; template literals break on the backticks summaries contain.'
+  'Calling convention in this session (PTC / code mode): `run_code` is the only directly callable tool — reach the ACP tools from inside a `run_code` program (`await tools.compress({ content: [...] })`, `await tools.acp_status({})`, `await tools.recall({ blockId })`, `await tools.recall({ query })`). A direct call naming them produces no call and no error — it silently emits text. Build summary strings from single-quoted lines joined by a newline; template literals break on the backticks summaries contain.'
 
 /** One short line for the range-table footer (the per-step decision point). */
 export const PTC_FOOTER_NOTICE =
@@ -79,15 +79,21 @@ export const PTC_TOOL_CLAUSE =
 /** Direct-call syntax → the `run_code` SDK form. The `(?<!tools\.)` guard keeps
  *  the rewrite idempotent (a re-scan must not double-prefix what it just wrote)
  *  and leaves prose mentions of the tool names alone — only `name({` and
- *  `search_context(query)` are call shapes. Exported for the nudge path, which
- *  rewrites the ALREADY-RENDERED kernel text rather than its templates. */
+ *  `name(query)` are call shapes. Exported for the nudge path, which rewrites
+ *  the ALREADY-RENDERED kernel text rather than its templates.
+ *
+ *  The retired names (`decompress` / `search_context`) are rewritten too: a
+ *  `config.prompts` override written before the merge still carries them, and
+ *  text that names a tool the surface no longer has is worse than stale prose. */
 export function toPtcCallSyntax(text: string): string {
   return text
-    .replace(/\bsearch_context\(query\)/g, 'await tools.search_context({ query })')
+    .replace(/\brecall\(query\)/g, 'await tools.recall({ query })')
+    .replace(/(?<!tools\.)\brecall\(\{/g, 'await tools.recall({')
     .replace(/(?<!tools\.)\bcompress\(\{/g, 'await tools.compress({')
-    .replace(/(?<!tools\.)\bdecompress\(\{/g, 'await tools.decompress({')
-    .replace(/(?<!tools\.)\bsearch_context\(\{/g, 'await tools.search_context({')
     .replace(/(?<!tools\.)\bacp_status\(\{/g, 'await tools.acp_status({')
+    .replace(/\bsearch_context\(query\)/g, 'await tools.recall({ query })')
+    .replace(/(?<!tools\.)\bsearch_context\(\{/g, 'await tools.recall({')
+    .replace(/(?<!tools\.)\bdecompress\(\{/g, 'await tools.recall({')
 }
 
 /** Render-time mode switch for text the kernel produced (the nudge): rewrite the
@@ -129,12 +135,16 @@ export function toPtcPrompts(prompts: ResolvedPrompts): ResolvedPrompts {
       ...rewriteGroup(prompts.tools),
       compress: `${PTC_TOOL_CLAUSE}\n${toPtcCallSyntax(prompts.tools.compress)}`,
     },
+    // Parameter copy is prose about "what goes in this field" and carries no call
+    // shape, so it rides through the PTC rewrite unchanged (a `compress({…})` in a
+    // parameter description is a counter-example name, not an instruction).
+    toolParamTexts: prompts.toolParamTexts,
     systemPromptTemplate: `${PTC_SYSTEM_LINE}\n\n${toPtcCallSyntax(prompts.systemPromptTemplate)}`,
   }
 }
 
 /** The call hint used in tool RESULT text (errors / recommendations). */
-export function callHint(style: ResolvedCallStyle, name: 'compress' | 'decompress', shape: string): string {
+export function callHint(style: ResolvedCallStyle, name: 'compress' | 'recall', shape: string): string {
   return style === 'ptc' ? `await tools.${name}(${shape})` : `${name}(${shape})`
 }
 
@@ -148,5 +158,5 @@ export const PTC_LEAK_CORRECTION =
  *  ACP tool — the signature of a direct call the engine parsed as text. */
 export function looksLikeLeakedAcpCall(text: string): boolean {
   return text.includes(TOOL_CALL_MARK)
-    && /\b(compress|decompress|search_context|acp_status)\b/.test(text)
+    && /\b(compress|recall|decompress|search_context|acp_status)\b/.test(text)
 }

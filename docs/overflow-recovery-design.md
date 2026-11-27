@@ -9,7 +9,7 @@
 - **ACP 唯一的自动压缩动作**：仅在 provider 明确确认上下文超窗（`failure.code === CONTEXT_WINDOW_EXCEEDED_CODE`）时，引擎自己挑一段最大且合规的范围隐藏一次（**不调模型**），再应答宿主的 `agent/request-error` 让该请求重试。
 - **压力侧不变**：仍然只 nudge、由模型决定压缩什么（设计决策 3）。两者不冲突——超窗时请求根本发不出去，不存在可以做出决策的模型回合。
 - **预算**：`maxOverflowRetries`（默认 `1`，与宿主 compaction-basic 的「一次自己拥有的重试」对齐；`0` 关闭）。按请求计数，模型有进展（落一条 assistant 消息）或 agent 回到 idle 即重置。
-- **摘要是引擎写的标记**（engine-written marker），不是模型摘要，也不加「Model-written」前缀；原文全部留在日志里，`search_context` / `decompress` 找得回，模型之后还能用 `compress` 覆盖它、写一份真摘要。
+- **摘要是引擎写的标记**（engine-written marker），不是模型摘要，也不加「Model-written」前缀；原文全部留在日志里，`recall` 找得回，模型之后还能用 `compress` 覆盖它、写一份真摘要。
 
 ## 1. 问题：禁用 compaction-basic 之后，超窗没人接
 
@@ -22,7 +22,7 @@
 
 - **压力侧自动压缩 = 替模型做语义判断**「哪段内容已经消化完」——这正是 ACP 的立身之本（设计决策 3：自动策略只 nudge，模型决定）。引擎没有这份判断，压缩错了就是永久的信息损失。
 - **超窗是硬失败**：provider 已经拒绝了该请求，模型没有回合，`compress` 工具无法被调用；引擎不动手，会话就卡在错误上。
-- **动作可逆、可重写**：隐藏的是 durable block，原文留在 append-only 日志（`search_context` 仍索引原文、`decompress` 可恢复），模型之后还能对这个 block 再跑一次 `compress` 写一份真正的摘要。信息没有丢，只是暂时折叠。
+- **动作可逆、可重写**：隐藏的是 durable block，原文留在 append-only 日志（`recall` 的检索形态仍索引原文、读形态可恢复），模型之后还能对这个 block 再跑一次 `compress` 写一份真正的摘要。信息没有丢，只是暂时折叠。
 - **自动动作的范围不超过模型本来能选的范围**：选举走的是同一张表 `buildCompressibleSeqRanges`（`src/region.ts`），宿主 guard 全部照旧生效——保护近尾（`preserveRecent: 5`）、最后一条真实 user turn（`isRealUserTurn`）、当前指令行（rule 16）、checkpoint、系统节点。因此紧急路径**压不到**模型自己都不允许压的东西。
 
 ## 3. 机制
@@ -62,7 +62,7 @@ ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => { … 
 
 ## 4. 摘要是引擎写的，不是模型写的
 
-超窗恢复的 summary 用 `overflowMarkerSummary(hiddenCount)`（`src/messages.ts`）构造，文案以 `ENGINE_SUMMARY_LEAD = '[engine-written summary — context-overflow emergency compaction'` 开头，说明「多少个表面消息因为超窗被隐藏、原文在日志里、可用 search_context/decompress 取回、也可再用 compress 覆盖写正式摘要」。
+超窗恢复的 summary 用 `overflowMarkerSummary(hiddenCount)`（`src/messages.ts`）构造，文案以 `ENGINE_SUMMARY_LEAD = '[engine-written summary — context-overflow emergency compaction'` 开头，说明「多少个表面消息因为超窗被隐藏、原文在日志里、可用 recall 找回（`recall({ query })` 检索 / `recall({ blockId })`、`recall({ seq })` 读原文）、也可再用 compress 覆盖写正式摘要」。
 
 它**不加** `SUMMARY_FRAME_PREFIX`（「Model-written summary — not user words…」）——那句话宣称的是模型写的来源，贴在引擎 marker 上就是造假。
 
@@ -71,7 +71,7 @@ ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => { … 
 PR #153 原实现走的是另一条路：`CompactionTransactionInput` 加一个 `framed?: boolean`，超窗事务传 `framed: false`。这是**真缺陷**，不是风格问题：调用方的 flag 读侧看不见，而 `projectEvent` 对任何 checkpoint 节点都会按内容加帧，于是
 
 - 模型在上下文里看到的前缀是「Model-written summary — …」（与事实不符），而
-- durable 事件与 `decompress` 头读到的是无前缀文本 → **存/投文本分裂**（正是 rule 18 留档过的那类 `prefix/raw mismatch`，评审时已抓到过一次）。
+- durable 事件与 `recall` 读回的块头是无前缀文本 → **存/投文本分裂**（正是 rule 18 留档过的那类 `prefix/raw mismatch`，评审时已抓到过一次）。
 
 修法把豁免移到 `withSummaryFramePrefix` 里，于是 durable 字节与模型可见字节**由构造保证一致**，`framed` 选项与 `framed: false` 调用点一并删除。老不变式仍有守：`tests/injection-governance.test.ts:38` pin 住 `SUMMARY_FRAME_PREFIX` 字面量，`:84` 断言「投影期也会给 legacy 块补帧」，`tests/tools.test.ts:314` 断言解压头回显该帧。
 

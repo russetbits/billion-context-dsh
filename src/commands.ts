@@ -1,13 +1,13 @@
 /**
  * M4 — the `/acp-prune` slash command: a human-friendly window into the same
- * machinery the model tools expose (status, one-shot compress, decompress,
+ * machinery the model tools expose (status, one-shot compress, the block dump `recall` pages,
  * runtime settings read/write).
  * @module billion-context-dsh/commands
  */
 
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { guardedRowsInSpan, liveCarrierRejectionNote, protectedRowRejectionNote, resolveEffectiveWindow, type ToolEnvironment } from './tools.ts'
+import { guardedRowsInSpan, liveCarrierRejectionNote, protectedRowRejectionNote, resolveEffectiveWindow, type ToolEnvironment } from './shared.ts'
 import { resolveTokenCount } from './nudge.ts'
 import { kernelConfigFor } from './config.ts'
 import { SettingsConflictError } from '@deepseek-ai/dsh-settings'
@@ -104,7 +104,7 @@ async function statusText(env: ToolEnvironment, agent: Agent): Promise<string> {
   // in the GUI anyway, so length has no cost (issue #47).
   for (const block of ledger) {
     const tier = block.tier > 1 ? ` [T${block.tier}]` : ''
-    lines.push(`  - ${block.blockId.slice(0, 8)}${tier}: seqs ${block.start}..${block.end} — ${block.summary.slice(0, 80)}`)
+    lines.push(`  - ${block.blockId.slice(0, 8)}${tier}: seqs ${block.start}..${block.end} — ${block.summary.replace(/\s+/g, ' ').slice(0, 80)}`)
   }
   return lines.join('\n')
 }

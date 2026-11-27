@@ -5,7 +5,7 @@
  * session is live. Durability does not rely on a sidecar file: every durable
  * compression writes a `compaction/summary` event whose shadowed range and
  * summary re-derive the block ledger (`rebuildBlockLedger` in region.ts), so a
- * restarted engine can answer decompress/search/status from the session log
+ * restarted engine can answer recall/search/status from the session log
  * alone — DSH's "log is the source of truth" model.
  *
  * Tier-2/3 distillation additionally requires the kernel state to KNOW the

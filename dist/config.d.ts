@@ -14,6 +14,7 @@
  * @module billion-context-dsh/config
  */
 import { type Config } from './kernel/index.ts';
+import type { TextOverrides } from './prompts.ts';
 import { type FoldPricing } from './region.ts';
 /** The kernel-facing knobs shared by the nudge path and the compress tool. */
 export interface KernelConfigInput {
@@ -91,10 +92,35 @@ export declare const WORKING_SET_FLOOR_MIN_TOKENS = 8192;
  */
 export declare const WORKING_SET_FLOOR_MAX_TOKENS = 16384;
 /**
- * Smallest reclaim worth a permanent barrier once the election degrades below the
- * floor (cross-review Q5): a 1K fold buys 1K of relief for one surface split that
- * can never be folded again — the worst barrier-per-byte ratio possible.
+ * The ONE number the condense floor gate uses: a fold whose remainder falls under
+ * `floorTokens` is refused (`condenseFloorRefusal` names the compliant move), and
+ * `force: true` is the operator's bypass. No election-side cost model exists any more:
+ * the price of a fold is REPORTED (`foldCostTokens`), never used to refuse one.
  */
-export declare const MIN_DEGRADED_FOLD_TOKENS = 4096;
 export declare function foldPricingFor(input: KernelConfigInput): FoldPricing;
 export declare function kernelConfigFor(input: KernelConfigInput): Config;
+/**
+ * `textOverrides` —— 按 id 整条替换模型可见文案(纯呈现层,不参与任何校验)。
+ *
+ * **替换,不是追加。** 覆盖值直接取代原文案,未列出的 id 保持英文默认。
+ * 这样一次覆盖的 token 成本 ≈ 原成本,配置不会变成"悄悄变贵"的渠道。
+ *
+ * **中文提示词不比英文省 token —— 恰恰相反。** 本插件的文案是英文的:
+ * 一段 600 字符的英文工具描述约 150 token;翻成同义的 300 个汉字约
+ * 300–450 token(估算口径:CJK 1 字/token、其余 4 字符/token),成本涨
+ * **1–3 倍**,而它每一轮请求都要重新计费。所以 `textOverrides` 的正确用法是
+ * **用更短的话说同样的事**,或者换一套口径;把它当"翻译开关"用,会让长会话
+ * 明显变慢变贵。超过默认值 1.5 倍的覆盖会得到一行 warning(不拒绝):
+ * 最容易踩的就是这个坑。
+ *
+ * 不接受覆盖的:note 骨架(`## Task`/`## Now`/…)与 kernel 内的文案 ——
+ * 前者是校验契约,后者不是本仓的资产。
+ */
+export interface TextOverrideConfig {
+    /**
+     * Override any built-in prompt string by id. Unlisted ids keep the English default.
+     * Ids come from `ableTextIds()` (`nudge.*`, `rangeTable.*`, `tool.*`, `systemPrompt`).
+     * A value REPLACES the default text — it is never appended.
+     */
+    readonly textOverrides?: TextOverrides;
+}

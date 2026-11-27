@@ -35,7 +35,10 @@ const ACP_EXTENSION_FIELDS = [
 ] as const
 
 test('B1-1 prefix constant and idempotency', () => {
-  assert.equal(SUMMARY_FRAME_PREFIX, '[Model-written summary — not user words; re-verify any obligations before relying on them]')
+  // Assert the CONTRACT, not the wording: a test that pins the full sentence has to be
+  // edited every time the frame is reworded, which pushes maintainers to skip the edit.
+  assert.ok(SUMMARY_FRAME_PREFIX.startsWith('[Model-written summary — not user words'))
+  assert.ok(SUMMARY_FRAME_PREFIX.includes('recall'), 'the frame must say the originals survive')
   const once = withSummaryFramePrefix('## User goal (verbatim)…')
   assert.ok(once.startsWith(SUMMARY_FRAME_PREFIX))
   assert.ok(once.includes('## User goal'))

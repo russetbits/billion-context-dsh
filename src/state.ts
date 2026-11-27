@@ -5,7 +5,7 @@
  * session is live. Durability does not rely on a sidecar file: every durable
  * compression writes a `compaction/summary` event whose shadowed range and
  * summary re-derive the block ledger (`rebuildBlockLedger` in region.ts), so a
- * restarted engine can answer decompress/search/status from the session log
+ * restarted engine can answer recall/search/status from the session log
  * alone — DSH's "log is the source of truth" model.
  *
  * Tier-2/3 distillation additionally requires the kernel state to KNOW the
@@ -116,7 +116,7 @@ export class AcpStateStore {
    * deterministic — bN ids are recorded in the durable event or synthesised
    * in ledger order, and run ids continue after the rehydrated max — so block
    * identity survives eviction exactly as it survives a restart. Kernel
-   * fields that reset on eviction (tokenSnapshot, nudge cadence, stats
+   * fields that reset on eviction (nudge cadence, stats
    * counters) all self-heal on the session's next turn.
    */
   private readonly states: LruMap<string, CompressionState>

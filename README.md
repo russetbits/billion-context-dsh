@@ -45,7 +45,7 @@
 
 - **模型驱动** —— 摘要由模型自己书写，没有第二次 LLM 摘要调用
 - **只建议、不强令** —— 自动策略只 *nudge*（提醒），是否压缩、何时压缩由模型决定（唯一的例外：provider 确认的上下文超窗会让引擎自己抢救一次——见配置表的 `maxOverflowRetries`）
-- **持久且可恢复** —— 压缩范围成为 checkpoint 节点，原文保留在 append-only 会话日志中；`decompress` 可恢复，`search_context` 可在块内查找
+- **持久且可恢复** —— 压缩范围成为 checkpoint 节点，原文保留在 append-only 会话日志中；`recall` 既能按关键词在块内检索，也能按块/seq 把原文读回来（两种形态互斥，一次调用只用一种）
 - **长任务稳得住** —— 每一步都接着前面的成果走，关键结论持续可用、不断叠加，超长任务更容易跑完
 - **上下文始终精简** —— 每次请求都只用少量、精炼的上下文，只保留关键信息；不做大段统一压缩，细节不随之衰失，token 消耗自然更低
 
@@ -69,7 +69,7 @@ dsh plugin --profile web add billion-context-dsh
 命令内部会装包并把本包的 bundle 补丁（[cordis.patch.yml](cordis.patch.yml)）自动挂进该 profile 的层栈。补丁做了两件事：
 
 - **禁用 host 的 `compaction-basic`**——避免同一 realm 内两个后端同时注册 `ctx.compaction` 冲突（现代 DSH 的 web bundle 已自带该禁用，此行为幂等兜底，任何受支持版本下都成立）；
-- **把 ACP 引擎挂到 host 平面**——四种模型工具（`compress` / `decompress` / `search_context` / `acp_status`）、`/acp-prune` 命令、nudge、ACP 提示词段对该 profile 的**所有模式**（standard / code / minimal / cordis / 自定义预设）生效。窗口自动探测、工具/命令/nudge 默认全开，**无需任何手工配置**。
+- **把 ACP 引擎挂到 host 平面**——三个模型工具（`compress` / `recall` / `acp_status`）、`/acp-prune` 命令、nudge、ACP 提示词段对该 profile 的**所有模式**（standard / code / minimal / cordis / 自定义预设）生效。窗口自动探测、工具/命令/nudge 默认全开，**无需任何手工配置**。
 
 装完**重启 `dsh`**（bundle 层在启动时组合），新开会话即可用——让模型调用 `acp_status` 或执行 `/acp-prune status` 自证。shipped 预设（standard / code / cordis）内部的 realm 级 `compaction-basic` 自动压缩兜底仍然保留（这些模式里"自动摘要"照旧，ACP 工具与 nudge 并存）；minimal 等不带 compaction realm 的预设直接使用本引擎。
 
@@ -192,9 +192,8 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 | `compress` 工具遮蔽一段范围 | 持久化 `surfaceOp: { op: 'replace' }`——模型书写的摘要成为 checkpoint 节点；原文保留在日志中 |
 | refs（`m00001` 标签） | surface seq，由 nudge 的可压缩范围表携带 |
 | nudge（"效率提示——尽早压缩保持精简"） | 由内核的压力决策在 `agent/pre-step` 注入——效率通知 + 上下文分解 + 压缩规则，语气对齐 kernel/pi；绝非命令 |
-| `decompress` | 从日志只读恢复被遮蔽的原文 |
-| `search_context` | 从日志重建块摘要 + 被遮蔽原文的统一文档集（按日志快照缓存：新事件落盘前重复搜索直接复用，issue #133），交 acp-kernel `searchBlocks`（hybrid：词干化 + CJK bigram + 字符 n-gram 模糊）打分；命中回链所属块 |
-| `acp_status` | CONTEXT BREAKDOWN（tool/text/summaries 占可见总量）+ 压缩块账本 + nudge 决策行 + `Checkpoint seqs` 行（active 块的 `bN → seq` 映射——压缩某个 checkpoint seq 即蒸馏该块，issue #60）；不含上下文窗口；支持 scope/view/tool/sort/limit 钻取 |
+| `recall` | 两种互斥形态：`query` 从日志重建块摘要 + 被遮蔽原文 + 仍可见表面的统一文档集（按日志快照缓存：新事件落盘前重复搜索直接复用，issue #133），交 acp-kernel `searchBlocks`（hybrid：词干化 + CJK bigram + 字符 n-gram 模糊）打分，命中回链所属块；`blockId`/`seq` 从日志只读恢复被遮蔽的原文 |
+| `acp_status` | CONTEXT BREAKDOWN（tool/text/summaries 占可见总量）+ 压缩块账本 + nudge 决策行 + `Checkpoint seqs` 行（active 块的 `bN → seq` 映射——压缩某个 checkpoint seq 即蒸馏该块，issue #60）；不含上下文窗口；支持 `detail` 钻取（compressed / visible / messages，无参数 = overview）+ `tool`/`sort`/`limit` |
 | 块状态 | 内存内核状态 + **日志重建账本**（无旁车文件） |
 | 分层蒸馏（T2/T3） | 再次压缩某块的摘要节点 = 蒸馏该块（tier 2），蒸馏 tier-2 块得 tier 3；tier 与内核块 id 持久化进日志，重启后内核状态从日志再水合、可继续蒸馏 |
 | 压缩记账（影子价格） | `shadowedTokenCount`（宿主占用率据此扣减）**用宿主 token-meter 的固定启发价计价**（`ctx.tokenMeter.measure` 优先、按 `heuristicTokens ?? tokens` 读固定启发价基准，`src/host-tokens.ts` 精确镜像兜底）——绝不混用插件内部的 CJK 感知估算（那是展示货币，混用会把宿主账本扣成负数、卡死中文会话，issue #54），也不按路由重定价的 `node.tokens` 计价（0.1.2+ 图片路由计价下那是请求压力价，读它会让含图片区间的 claim 虚报视觉价、同样扣穿账本，issue #103） |
@@ -214,10 +213,9 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 | 工具 | 作用 |
 | --- | --- |
 | `compress` | 用你书写的紧凑摘要替换 seq 范围（边界自动平衡到 tool-call/result 配对点）；对某块的摘要节点再次压缩 = 分层蒸馏（tier 2/3）。每个 range 可附 `verifiedReadings: string[]`——记录该范围里你实际读过并核实过的文件/章节，随摘要持久化，并在 compress 结果中以 `verified: …` 回显，后续回合不必重读即可知道哪些已核实。`compress({ condense: { summary } })` 是**引擎选段**的折叠：引擎从当前表面挑出**最大的可行连续段**（屏障=各 scope 的最新注入副本、最新 skill 目录、checkpoint 载体、系统节点、活动用户回合；被取代的旧注入副本一起折掉，因为它们不会回来），一次 replace 落地，模型只写交接 note——note 必须含 `## Goal` 与 `## Next`，缺一个就什么都不落。nudge 区间表的 `fold ~N` 是**下一轮要重算的量**：durable replace 之后 slot 只能复用到改写点为止，改写点之后全部重算；改写点之前的固定请求头（system prompt、工具注册表）被暖缓存复用、不计价，落在改写点之后的注入行则算进这段价格。实测 2026-11-15 真调：折后首条 prompt 125,665、`reused` 31,378（未命中 94,287、49.3 s），再下一轮回到稳态（`reused`≈prompt、1.3–5.6 s）⇒ **改写点位置是杠杆之一**（越靠前越贵），折叠量决定后续每一轮省多少；一次调用只付一次重算，所以已消费的区间要批量折进同一次调用。`condense` 还会在**落盘之前**拒两种情况：note 重量超过被折叠段的 `MAX_NOTE_WEIGHT_RATIO`（0.35）——那种 note 等于把原文又抄一遍还永久常驻在每个后续请求里，折叠永远赚不回成本；以及选中的段折完剩不到 `foldFloorPct`（见下表）。顶层 `force: true` 解除工作集守卫（note 重量检查不受 force 影响，因为一条臃肿的 note 没有任何合法理由）。模型自己指定的 `content` 区间受同一条工作集守卫约束。 |
-| `condense` | 引擎算出**当前最大可行连续段**（受保护行、折叠屏障、工作集下限都算过）并交给你，你只写交接 note：必须含 `## Goal`/`## Next`，note 体量上限＝被折叠段的 35%（超了什么都不写就拒）。一次调用＝一个重写点＝一次整段重算，比你自己猜 seq 更准。**「何时折」依然是你的决定**（引擎从不自己调用 `condense`）；「折到哪」是算术而非判断，「折完留什么」仍由你写——所以这不违背上面「模型决定何时压缩、压缩什么」。低于下限的拒绝会**分清三种情形**：还有行折完能保住下限（折那一行——最宽的选中行正是把工作集榨干的那条，折得越多剩得越少）／被守卫切碎（别盲目放宽，唯一合规出口是一条 `force:true` 的显式 range）／根本没有可折段（停止压缩继续干活）。当**没有任何行**能保住下限、且最大可行段 ≥ `max(4096, floor/2)` 时，引擎不再硬拒而是**降级折最大的低于下限段**，并在 note 里追加一条 `[dsh:degraded] …` 机器可读来源标记，同时在本轮的工具结果里引用同一条标记（唯一来源仍是落盘 note，结果那行只是引用，好让你当轮就知道这次是降级折），好让日后的工作集统计、检索命中与蒸馏能认出这是孤注一掷而非合规折叠。第三轮曾按屏障数 `ceil(window/(2×floor))` 设门，第四轮删除：一条屏障是摘要 note（几百 token）而不是一个下限大的洞，折叠次数根本不度量它声称的债务；32K 窗口配 16K 上限时那道门永远够不到，死锁仍关着；而且它可能在一行 20K 高于下限的段仍然可用时就触发降级。`force:true` 是操作者自己的孤注一掷，不打这个标记 |
-| `decompress` | 恢复已压缩块的原始内容（只读）；接受 acp_status 显示的 `bN` 或 compaction id。大块按字符预算分页（默认每页约 7K 字符、至多 100 条），使普通页面低于宿主 tool-result 截断阈值（8192）；`offset`/`limit` + 续页提示走完全块 |
-| `search_context` | 按关键词搜索压缩块摘要与原文（acp-kernel hybrid 检索：词干化 + CJK bigram + 模糊）；命中回链所属块 |
-| `acp_status` | CONTEXT BREAKDOWN（tool/text/summaries 占可见总量）+ 压缩块账本 + nudge 决策行 + `Checkpoint seqs` 行（active 块的 `bN → seq` 蒸馏入口，issue #60）；不含上下文窗口。另有两行引擎追加的模型侧数据：`Request input sizes: live | peak | window | room`（折一次的代价 ≈ 把 live 部分整段重算一次，所以百分比本身不足以判断值不值）与 `Fold barriers: N`（每次折叠都会留下**永久不可再折**的摘要节点，N 是已花掉的额度，越大意味着后续可折的连续段越小。这一行不再给「解禁阈值」：第四轮删掉了按折叠次数推算的门（折叠次数并不度量屏障债务，见上表 `condense`），能不能低于下限改由当前行集合判定（`condenseDegradable`））。第三行 `Fold floor: …` 报出会**拒绝**折叠的存活下限（原先只在 nudge 里可见，而 nudge 只在压力越过阈值时才发，所以中等压力下的模型是在盲调 `condense`），数值取自与门禁同一个 `foldPricingFor`；接近下限时提示选**更窄**的区间——折叠留下的是它没有删掉的存活量，更宽反而撞进门禁。刻意不打印「最优候选区间」：算它要跑 `buildCompressibleSeqRanges`，其孤儿清理会**追加** durable prune 事件，而 `acp_status` 是只读工具。支持钻取：`scope:"compressed"` 逐块、`scope:"uncompressed"` + `view:"messages"`/`"ranges"` 逐消息/区间，`tool` 过滤、`sort` 排序、`limit` 截断。钻取行 ref 是内核 mN——可直接作为 `compress` 的 `startSeq`/`endSeq`（自动映射为 live surface seq）；`Surface:` 的 seq 同样可用 |
+| `condense` | 引擎算出**当前最大可行连续段**（受保护行、折叠屏障、工作集下限都算过）并交给你，你只写交接 note：必须含 `## Goal`/`## Next`，note 体量上限＝被折叠段的 35%（超了什么都不写就拒）。一次调用＝一个重写点＝一次整段重算，比你自己猜 seq 更准。**「何时折」依然是你的决定**（引擎从不自己调用 `condense`）；「折到哪」是算术而非判断，「折完留什么」仍由你写——所以这不违背上面「模型决定何时压缩、压缩什么」。低于下限的拒绝会**分清三种情形**：还有行折完能保住下限（折那一行——最宽的选中行正是把工作集榨干的那条，折得越多剩得越少）／被守卫切碎（别盲目放宽，唯一合规出口是一条 `force:true` 的显式 range）／根本没有可折段（停止压缩继续干活）。低于下限**一律拒绝**，引擎不会自己在更低处折：`foldCostTokens` 只作为**报价**报告（重写点之后的一次整段重算），不作为拒绝理由——引擎无法预测会话还剩多少请求，所以不拿一个无法验证的成本模型去挡折叠。`force:true` 是操作者自己的逃生阀，不带任何标记 |
+| `recall` | **一个入口、两种互斥问法**（`query` 与 `blockId`/`seq` 同给会被拒绝并点名该去掉哪个）：<br>① `recall({ query })` 按关键词搜索压缩块摘要、被遮蔽原文与仍可见表面（acp-kernel hybrid 检索：词干化 + CJK bigram + 模糊），命中回链所属块或可见 seq，`maxResults` 控制条数（默认 5）；<br>② `recall({ blockId })` 恢复已压缩块的原始内容（只读；接受 acp_status 显示的 `bN` 或 compaction id；大块按字符预算分页，默认每页约 7K 字符、至多 100 条，使普通页面低于宿主 tool-result 截断阈值 8192，`offset`/`pageLimit` + 续页提示走完全块），`recall({ seq })` 精读单条事件原文（`chars` 限长，默认 20000、上限 100000） |
+| `acp_status` | CONTEXT BREAKDOWN（tool/text/summaries 占可见总量）+ 压缩块账本 + nudge 决策行 + `Checkpoint seqs` 行（active 块的 `bN → seq` 蒸馏入口，issue #60）；不含上下文窗口。另有两行引擎追加的模型侧数据：`Request input sizes: live | peak | window | room`（折一次的代价 ≈ 把 live 部分整段重算一次，所以百分比本身不足以判断值不值）与 `Fold barriers: N`（每次折叠都会留下**永久不可再折**的摘要节点，N 是已花掉的额度，越大意味着后续可折的连续段越小。这一行不再给「解禁阈值」：第四轮删掉了按折叠次数推算的门（折叠次数并不度量屏障债务，见上表 `condense`），而低于下限的折叠已不存在：模型路径直接拒绝，`force: true` 是操作者自己的唯一出口）。第三行 `Fold floor: …` 报出会**拒绝**折叠的存活下限（原先只在 nudge 里可见，而 nudge 只在压力越过阈值时才发，所以中等压力下的模型是在盲调 `condense`），数值取自与门禁同一个 `foldPricingFor`；接近下限时提示选**更窄**的区间——折叠留下的是它没有删掉的存活量，更宽反而撞进门禁。刻意不打印「最优候选区间」：算它要跑 `buildCompressibleSeqRanges`，其孤儿清理会**追加** durable prune 事件，而 `acp_status` 是只读工具。支持钻取：`detail:"compressed"` 逐块、`detail:"visible"` 合并后的可折区间、`detail:"messages"` 逐消息，无参数 = overview；`tool` 过滤（仅 `detail:"messages"`）、`sort` 排序、`limit` 截断。钻取行 ref 是内核 mN——可直接作为 `compress` 的 `startSeq`/`endSeq`（自动映射为 live surface seq）；`Surface:` 的 seq 同样可用 |
 | `/acp-prune` | 从命令栏执行 status / compress / decompress；status 额外展示 human-side 窗口信息（estimated context、context window 来源、压缩账本、**nudge 仲裁**——`nudge: idle/ACTIVE — reason` 及距下一次 nudge 还差多少 token，与 nudge 路径同一内核判定） |
 
 - **摘要标源（模型自写摘要的框架行）**：每条压缩摘要在写入时前置 `[Model-written summary — not user words; re-verify any obligations before relying on them]`——同时写进持久化摘要事件与其 checkpoint 节点（同一份文本），投影路径对旧块幂等补框。目的：阻止模型把摘要里的义务句当成用户原话直接执行。
@@ -252,7 +250,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 | `autoTools` | `true` | 在 `ctx.tools` 注册四个模型工具 |
 | `autoCommand` | `true` | 在 `ctx.commands` 注册 `/acp-prune` 命令 |
 | `autoNudge` | `true` | 当内核建议时向 `agent/pre-step` 注入 nudge（运行时热调：`/acp-prune config`） |
-| `maxOverflowRetries` | `1` | 宿主确认的上下文超窗（`CONTEXT_WINDOW_EXCEEDED`）自动抢救预算：超窗时引擎挑一段**最大且合规**的范围做一次紧急压缩（摘要是引擎自己写的标记，不调模型——请求刚被拒，本就没有模型回合可写摘要；原文都留在日志里，`search_context`/`decompress` 找得回来），然后应答宿主的 `agent/request-error` 让该请求重试。预算按请求计数，模型有进展（落一条 assistant 消息）或 agent 回到 idle 即重置；`0` 关闭这个自动动作（错误原样抛给用户）。这是 ACP 唯一的自动压缩动作——压力侧始终只 nudge、由模型决定（组合行专用，不进 settings 层；原理与取舍见 [docs/overflow-recovery-design.md](docs/overflow-recovery-design.md)） |
+| `maxOverflowRetries` | `1` | 宿主确认的上下文超窗（`CONTEXT_WINDOW_EXCEEDED`）自动抢救预算：超窗时引擎挑一段**最大且合规**的范围做一次紧急压缩（摘要是引擎自己写的标记，不调模型——请求刚被拒，本就没有模型回合可写摘要；原文都留在日志里，`recall` 找得回来），然后应答宿主的 `agent/request-error` 让该请求重试。预算按请求计数，模型有进展（落一条 assistant 消息）或 agent 回到 idle 即重置；`0` 关闭这个自动动作（错误原样抛给用户）。这是 ACP 唯一的自动压缩动作——压力侧始终只 nudge、由模型决定（组合行专用，不进 settings 层；原理与取舍见 [docs/overflow-recovery-design.md](docs/overflow-recovery-design.md)） |
 | `settingsEnabled` | `true`（未配置即启用） | （可选）整体关闭运行时设置集成（组合行专用，不进 settings 层——开关不能关掉自己；关闭后组合行 `config:` 仍是唯一生效通道） |
 | `toolCallStyle` | `auto` | （可选）模型**怎么够到**这四个工具：`auto` 每步从宿主装配出的 system prompt 里认出 PTC / code mode（宿主自己的常量串，TS 与 Python SDK 都命中）并就地把调用形状换成 `await tools.compress({…})`；`native` / `ptc` 钉死，用于检测失效时人工纠正。PTC 下直调不报错也不产生调用（标记落成裸文本），所以文案形状就是唯一可学习的信号（组合行专用，不进 settings 层；见 `src/ptc.ts` 与「已修复的问题」） |
 | `prompts` | — | （可选）自定义提示词文案：nudge / 范围表 / system prompt / 工具描述按槽位覆盖（模板 + 命名占位符，构造期校验；见上文「自定义提示词文案」与 [docs/configurable-prompts-design.md](docs/configurable-prompts-design.md)） |
@@ -297,7 +295,7 @@ ref capacity exhausted: cannot allocate beyond m99999
 
 ### 续跑会话头几步全部 `unknown tool`：注册层随宿主注册表重建而丢失（v0.2.29 修复）
 
-被中断的 agent 循环重新继续时，头几个 step 的工具面里没有 `compress` / `decompress` / `search_context` / `acp_status`，模型每次调用都得到 `unknown tool`；等到插件实例被重新挂载才自愈（实测：缺工具窗口 = 前 2 个 step）。原因：`tools.register()` 是宿主 `layers.effect(ctx, …)` 的**层效果**，贡献挂在**接收注册的注册表实例**上；宿主重建 agent realm 时注册表被换成空实例，而插件实例仍在（激活期的 `done` 守卫禁止第二次尝试）。现在 `agent/pre-step` 每次都会核对本次 step 的工具面（`tools.get(name, agent)` 与全局视图**都**为空才算丢失），当场重新注册并在同一步生效；作用域级的 `tools.restrict()` 屏蔽不误判为丢失，因此不会每步重复插入。实现 `src/registration.ts`，回归 `tests/registration-heal.test.ts`。
+被中断的 agent 循环重新继续时，头几个 step 的工具面里没有 `compress` / `recall` / `acp_status`，模型每次调用都得到 `unknown tool`；等到插件实例被重新挂载才自愈（实测：缺工具窗口 = 前 2 个 step）。原因：`tools.register()` 是宿主 `layers.effect(ctx, …)` 的**层效果**，贡献挂在**接收注册的注册表实例**上；宿主重建 agent realm 时注册表被换成空实例，而插件实例仍在（激活期的 `done` 守卫禁止第二次尝试）。现在 `agent/pre-step` 每次都会核对本次 step 的工具面（`tools.get(name, agent)` 与全局视图**都**为空才算丢失），当场重新注册并在同一步生效；作用域级的 `tools.restrict()` 屏蔽不误判为丢失，因此不会每步重复插入。实现 `src/registration.ts`，回归 `tests/registration-heal.test.ts`。
 
 ### `compress` 传反了边界不再报错（v0.2.29）
 
@@ -344,7 +342,7 @@ src/
 ├── state.ts        # M2: 每会话内核状态
 ├── region.ts       # M5: 持久化区域事务 + 日志重建块账本
 ├── block-ledger.ts # M5 支持：tier/lineage 字段编码进 compaction/summary 的 rawOutput（绝不作顶层成员，issue #141）
-├── tools.ts        # M3: compress / decompress / search_context / acp_status
+├── tools.ts        # M3: compress / recall / acp_status
 ├── nudge.ts        # M4: 内核压力决策 → 注入的建议式 nudge
 ├── system-prompt.ts# M4: 一次性 ACP 指引段（让 nudge 保持简短）
 ├── config.ts       # 内核配置组装（阈值 + coreOverrides）

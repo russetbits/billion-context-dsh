@@ -5,8 +5,8 @@
  * The model decides when and what to compress (pure ACP semantics):
  *  - the `compress` tool durably shadows a surface range with the model-written
  *    summary (no second LLM summarization call — the ACP cost win);
- *  - the original events stay in the append-only session log, so `decompress`,
- *    `search_context`, and replay always work;
+ *  - the original events stay in the append-only session log, so `recall`
+ *    (its search form and its read form) and replay always work;
  *  - refs are surface seqs carried by the injected nudge's range table (DSH
  *    has no in-memory message rewrite hook — see docs/dsh-porting-verification.md);
  *  - automatic policy never summarizes by itself: it nudges the model.
@@ -44,9 +44,9 @@ import { AcpStateStore } from './state.ts'
 import { makeTools, type ToolEnvironment } from './tools.ts'
 import { acpCommand } from './commands.ts'
 import { healRegistrations } from './registration.ts'
-import { buildNudge, EMERGENCY_NUDGE_MAX_PER_TURN, meterMediaPriceResolver, resolveTokenCount } from './nudge.ts'
+import { buildNudge, EMERGENCY_NUDGE_MAX_PER_TURN, meterMediaPriceResolver, resolveTokenCount, type NudgeGate } from './nudge.ts'
 import { ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts'
-import { renderSystemPrompt, resolvePrompts, type AcpPrompts, type ResolvedPrompts } from './prompts.ts'
+import { applyTextOverrides, renderSystemPrompt, resolvePrompts, textOverrideWarningLines, type AcpPrompts, type ResolvedPrompts, type TextOverrides } from './prompts.ts'
 import { DEFAULT_CONTEXT_WINDOW, probeModelWindow, projectedContextWindow, routeFor, type AcpWindow } from './window.ts'
 import {
   buildCompressibleSeqRanges,
@@ -134,9 +134,15 @@ export { ACP_SYSTEM_PROMPT, ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts'
 export {
   DEFAULT_PROMPTS,
   DEFAULT_RESOLVED,
+  applyTextOverrides,
+  ableTextIds,
   renderSystemPrompt,
   renderTemplate,
   resolvePrompts,
+  textById,
+  textOverrideWarningLines,
+  type TextOverrideReport,
+  type TextOverrides,
   type AcpPrompts,
   type NudgePrompts,
   type PromptInput,
@@ -147,7 +153,7 @@ export {
 } from './prompts.ts'
 export { makeTools, type ToolEnvironment } from './tools.ts'
 export { acpCommand } from './commands.ts'
-export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type NudgeEnvironment, type NudgeOutcome } from './nudge.ts'
+export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type NudgeEnvironment, type NudgeGate, type NudgeOutcome } from './nudge.ts'
 export {
   DEFAULT_CONTEXT_WINDOW,
   detectContextWindow,
@@ -199,6 +205,24 @@ export {
   type SettingsCommandSurface,
   type SettingsKey,
 } from './settings.ts'
+
+/**
+ * The slice of the cordis loader this plugin touches. The base
+ * `@deepseek-ai/cordis` types do not declare a `loader` field — the loader
+ * package extends the context at runtime and provides the service itself
+ * (`cordis-plugin-loader/lib/index.js`, `ctx.reflect.provide("loader", …)`).
+ * A module augmentation would make the loader a compile-time dependency of a
+ * plugin whose peer set does not include it, so the service is reached through
+ * one structural assertion in `disableBasicOnce` instead.
+ */
+export interface LoaderEntryLike {
+  options?: { id?: string }
+  update(options: Record<string, unknown>): Promise<unknown> | unknown
+}
+
+export interface LoaderLike {
+  entries(): Iterable<LoaderEntryLike>
+}
 
 export interface AcpConfig {
   /**
@@ -278,6 +302,20 @@ export interface AcpConfig {
    */
   readonly maxOverflowRetries?: number
   /**
+   * Take over the host's own automatic compaction. A host composition that
+   * ALSO loads `compaction-basic` keeps running that engine's own
+   * `agent/pre-step` auto-compaction (its `auto` flag defaults to true), which
+   * silently replaces the model's `compress` summaries with a host-written one
+   * — measured on a live session: 121 messages / 77,280 tokens folded into a
+   * 32-character summary that dropped every user constraint it covered.
+   * `disableBasic` (default true) disables that loader entry at runtime, so ACP
+   * owns the only compression path and no message is ever summarized by a
+   * writer that does not know the note contract. Set false to keep the host's
+   * native behaviour instead. The mount NEVER fails over this: an unreachable
+   * loader/entry logs one warning and the plugin runs unchanged.
+   */
+  readonly disableBasic: boolean
+  /**
    * Escape hatch: disable the runtime-settings integration entirely
    * (composition-layer ONLY — deliberately not exposed through the settings
    * layer itself: a switch that turns off its own plumbing could not be
@@ -286,6 +324,16 @@ export interface AcpConfig {
   readonly settingsEnabled?: boolean
   /** Per-stage prompt template overrides (nudge / range table / system prompt / tool descriptions). See docs/configurable-prompts-design.md. */
   readonly prompts?: AcpPrompts
+  /**
+   * Flat id-addressed FULL REPLACEMENT of any model-visible text (`nudge.*`,
+   * `rangeTable.*`, `tool.*`, `systemPrompt`); ids come from `ableTextIds()`.
+   * Unlisted ids keep the English default. Applied AFTER `prompts` and BEFORE
+   * the PTC rewrite, so an override still adapts to the active calling
+   * convention. Non-string or unknown ids are ignored with one warning line —
+   * a typo must never stop the plugin from starting. See src/config.ts for the
+   * token-cost caveat (translation makes the copy heavier, not cheaper).
+   */
+  readonly textOverrides?: TextOverrides
   /**
    * How the model reaches the ACP tools. `auto` (default) detects PTC / code mode
    * from the assembled system prompt of each session every step; `native` or
@@ -304,6 +352,9 @@ const DEFAULT_CONFIG: AcpConfig = {
   // Same default as the host's compaction-basic policy: one owned retry per
   // unrelieved overflow, then the original error is preserved.
   maxOverflowRetries: 1,
+  // ACP is the only summarizer: the host's own `compaction-basic` engine would
+  // otherwise fold on its own schedule with a summary contract it never read.
+  disableBasic: true,
   // Nudge thresholds: engine defaults 0.70/0.85 — deliberately below the
   // kernel/billion-context-pi 0.75/0.95. 0.95 leaves no room to act before
   // the API rejects, and the host's compaction-basic line (thresholdRatio
@@ -445,6 +496,12 @@ export class AcpCompactionEngine extends CompactionEngine {
   readonly config: AcpConfig
   /** Resolved prompt templates (validated at construction — fail-fast on template typos). */
   readonly prompts: ResolvedPrompts
+  /**
+   * One-line diagnostics from `textOverrides` (unknown ids, oversized values).
+   * Empty when nothing was overridden. Logged once at construction and echoed by
+   * `acp_status`, because a composition-row config has no other visible surface.
+   */
+  readonly textOverrideLines: readonly string[]
   /** The prompt set ACTUALLY applied to the current step: `prompts` in native
    *  mode, its PTC variant in code mode (src/ptc.ts). `prompts` keeps the
    *  composition value so introspection and tests see what was configured. */
@@ -470,7 +527,10 @@ export class AcpCompactionEngine extends CompactionEngine {
    */
   readonly env: ToolEnvironment
 
-  private readonly lastNudgeTurn = new LruMap<string, number>(DEFAULT_SESSION_CACHE_LIMIT)
+  /** Set once the host's own auto-compaction entry has been handled (or proven absent), so the lookup runs at most once. */
+  private basicCompactionHandled = false
+
+  private readonly lastNudgeTurn = new LruMap<string, NudgeGate>(DEFAULT_SESSION_CACHE_LIMIT)
   /** Per-session emergency-nudge injection budget for the current user turn (issue #108). */
   private readonly emergencyNudges = new Map<string, { turn: number; count: number }>()
   /** Successful compress call ids awaiting their tool/result so the pair can be hidden. */
@@ -491,6 +551,72 @@ export class AcpCompactionEngine extends CompactionEngine {
   private readonly overflowRetries = new Map<Agent, number>()
   /** Per-session overflow agents, so session progress can reset the recovery budget. */
   private readonly overflowSessions = new Map<Session, Agent>()
+
+  /**
+   * Disable the host's own `compaction-basic` entry, at most once.
+   *
+   * A composition may load BOTH engines. `compaction-basic` runs its own
+   * `agent/pre-step` auto-compaction (`config.auto` defaults to true) and
+   * writes a summary that never read the ACP note contract — measured on a
+   * live session: 121 messages / 77,280 tokens folded into a 32-character
+   * summary with every user constraint in that span gone. Disabling its loader
+   * entry is a RUNTIME action: `Entry.update({ disabled: true })` writes the
+   * option and then disposes that entry's fiber
+   * (`cordis-plugin-loader/lib/index.js:493-506`), so no restart is involved.
+   *
+   * Fail-open in every direction — no loader service, no matching entry, or a
+   * throwing dispose each log ONE warning and leave the plugin running. A
+   * mount failure here would cost the session its only compression path, which
+   * is strictly worse than two engines competing.
+   */
+  private disableBasicOnce(): void {
+    if (this.basicCompactionHandled || !this.config.disableBasic) return
+    // Reading a cordis SERVICE that was never provided THROWS
+    // (`cannot get property "loader" without inject`), so the absence of a
+    // loader is not a null check — it is a caught throw. This is the whole
+    // reason the lookup is wrapped: a host without the loader plugin must keep
+    // running, not lose its only compression path to a failed mount.
+    let loader: LoaderLike | undefined
+    try {
+      loader = (this.ctx as unknown as { loader?: LoaderLike }).loader
+    } catch {
+      // Reading the service threw = the host has NO loader plugin at all, a
+      // PERMANENT environment fact. Silent + final: no composition row to
+      // disable, and warning every pre-step would spam forever.
+      this.basicCompactionHandled = true
+      return
+    }
+    try {
+      if (loader !== undefined && typeof loader.entries === 'function') {
+        for (const entry of loader.entries()) {
+          // `Entry.id` is the TREE path (`parent:child`), while `options.id` is
+          // the id the composition row declared — the latter is the stable match.
+          if (entry.options?.id !== 'compaction-basic') continue
+          // Found it: one attempt, never retried. A failing dispose is usually
+          // persistent (entry already disposed, service gone), so retrying would
+          // only spam warnings; this path is best-effort by design.
+          this.basicCompactionHandled = true
+          void Promise.resolve(entry.update({ disabled: true })).catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error)
+            this.ctx.logger.warn(`billion-context-dsh: could not disable compaction-basic: ${message} (will not retry)`)
+          })
+          return
+        }
+      }
+    } catch (error) {
+      // `entries()` itself can throw (host internals mid-rebuild); warn once and
+      // fall through to the retry next pre-step — the lookup is synchronous and
+      // costs nothing, and the handled flag is deliberately NOT set here.
+      const message = error instanceof Error ? error.message : String(error)
+      this.ctx.logger.warn(`billion-context-dsh: compaction-basic lookup failed: ${message}; will retry at the next pre-step`)
+      return
+    }
+    // A host without the loader plugin is a NORMAL environment, not a fault:
+    // there is no composition row to disable, so there is nothing to report.
+    // But a loader WITH no compaction-basic row is ambiguous — the entry may be
+    // late-loading (a dynamic install after the first pre-step), so leave the
+    // flag unset and keep the cheap synchronous lookup alive on later pre-steps.
+  }
   constructor(ctx: Context, config: Partial<AcpConfig> = {}) {
     super(ctx)
     // Class-mounted compositions arrive with the six knobs wrapped in volatile
@@ -500,7 +626,16 @@ export class AcpCompactionEngine extends CompactionEngine {
     this.config = resolveAcpConfig({ ...config, ...liveSettingsFromRefs(filterSettingsEntry(config)) })
     // Resolve + validate prompt templates BEFORE building env: a template typo
     // must fail engine construction, never silently leak into model context.
-    this.prompts = resolvePrompts(config.prompts)
+    // textOverrides lands between the structured `prompts` layer and the PTC
+    // rewrite: `prompts` stays the template path (validated, placeholder-checked),
+    // while an id override is a plain REPLACEMENT that must win over it, and must
+    // still be re-rendered into the active call syntax (toPtcPrompts below).
+    const textReport = applyTextOverrides(resolvePrompts(config.prompts), config.textOverrides)
+    this.prompts = textReport.prompts
+    this.textOverrideLines = textOverrideWarningLines(textReport)
+    if (this.textOverrideLines.length > 0) {
+      for (const line of this.textOverrideLines) this.ctx.logger.warn(`billion-context-dsh: ${line}`)
+    }
     // Calling convention at mount: a pinned `toolCallStyle: ptc` applies right
     // away; `auto` (the default) starts native and detects per session at the
     // first pre-step — the ASSEMBLED system prompt is the only place the mode is
@@ -514,7 +649,7 @@ export class AcpCompactionEngine extends CompactionEngine {
     // 8MB SOURCE-CHAR cap — sized for multi-session server processes. A DSH
     // profile is single-user and its search corpus (ALL shadowed originals)
     // routinely exceeds 8MB, so the default re-tokenizes the corpus on every
-    // search_context call (issue #133: ~18s/call on a 40MB corpus, cold and
+    // recall({ query }) call (issue #133: ~18s/call on a 40MB corpus, cold and
     // warm identical). The cap cannot be tuned DOWN instead — it evicts FIFO
     // and bills source chars only, so a cap below the corpus caches nothing
     // (measured: half the corpus → 1.1× on a repeat scan). 128MB covers the
@@ -704,6 +839,7 @@ export class AcpCompactionEngine extends CompactionEngine {
       // descriptions would send the model back to the failing shape).
       get prompts() { return engine.currentPrompts },
       get toolCallStyle() { return engine.appliedStyle },
+      get textWarnings() { return engine.textOverrideLines },
       compressCallIdsToHide: this.compressCallIdsToHide,
       settingsCommand: this.settingsCommand,
     }
@@ -795,75 +931,94 @@ export class AcpCompactionEngine extends CompactionEngine {
       // stale nudge rows BEFORE the orphan/broken-pair strip, so a nudge that used to
       // sit between a tool call and its result stops making that pair look broken —
       // the strip must never delete a real tool result to fix a row we authored.
-      pruneStaleNudgeRows(payload.agent.session)
-      stripOrphanedSurfaceToolMessages(payload.agent.session)
-      // Calibration pair for the emergency fit check (src/usage.ts): the newest billed
-      // request against the surface of the step that PRODUCED it. Pairing it with THIS
-      // step's surface would compare two moments — the surface already carries the
-      // previous step's output, so both the ratio and the absolute overhead shrink
-      // toward zero and the fit check under-quotes a fold that still overflows
-      // (round-10 review S2). calibrateRequestPair carries the previous surface.
-      setCalibrationRoute(payload.agent.session, `${routeFor(payload.agent).provider}/${routeFor(payload.agent).model}`)
-      const billed = lastRequestUsage(payload.agent.session)
-      calibrateRequestPair(payload.agent.session, billed?.tokens ?? 0, billed?.seq ?? 0, surfaceTokens(payload.agent.session))
-      // Hot-apply settings BEFORE any knob is read this step (issue #193): on
-      // the forms line, writes committed between steps land in our volatile
-      // refs with no event we receive — this re-read is what applies them.
-      engine.resyncSettings()
-      // Calling-convention gate BEFORE anything that renders model-facing copy:
-      // a PTC session must register `await tools.*` descriptions and nudge text,
-      // never the direct-call shape the host rejects (src/ptc.ts). Cheap — a
-      // marker scan over the session's system rows — and the heal below builds
-      // its definitions from `env`, so it must see the applied style.
-      const style = engine.resolveToolCallStyle(payload.agent.session)
-      if (style !== engine.appliedStyle) engine.applyToolCallStyle(style)
-      // Registration self-heal (src/registration.ts): `tools.register()` is a
-      // layer effect on the REGISTRY instance, so when the host rebuilds an
-      // agent realm the four ACP tools vanish while this plugin instance stays
-      // mounted — and the activation `done` guard forbids a second attempt.
-      // Live signature (2026-11-01): every model call answered `unknown tool`
-      // for the first two steps of a resumed session. Checking here (before
-      // `next()` builds the request) restores them within the SAME step, and
-      // runs regardless of `autoNudge` because a nudging-off session still
-      // needs the tools.
-      const healed = healRegistrations(env, ctx.get('tools'), ctx.get('commands'), payload.agent)
-      if (healed.tools.length > 0 || healed.command) {
-        ctx.logger.warn(
-          `billion-context-dsh: re-registered ${healed.tools.join(', ')}${healed.command ? ' + /acp-prune' : ''} on session ${payload.agent.session.id} — the host registry was rebuilt since activation`,
-        )
+      // B-1（2026-11-23）：整段 housekeeping 必须 fail-open。这里任何一处抛错
+      // （宿主 registry 重建、设置热应用、校准样本异常、块账本重建）都会让整个
+      // pre-step 拒绝，代价是一整个回合而不是一条提示。
+      try {
+        // Take the host's own auto-compaction engine down before any of our
+        // bookkeeping runs: it must never fold a span of this session with a
+        // summary contract it never read (`disableBasic`, default true).
+        this.disableBasicOnce()
+        pruneStaleNudgeRows(payload.agent.session)
+        stripOrphanedSurfaceToolMessages(payload.agent.session)
+        // Calibration pair for the emergency fit check (src/usage.ts): the newest billed
+        // request against the surface of the step that PRODUCED it. Pairing it with THIS
+        // step's surface would compare two moments — the surface already carries the
+        // previous step's output, so both the ratio and the absolute overhead shrink
+        // toward zero and the fit check under-quotes a fold that still overflows
+        // (round-10 review S2). calibrateRequestPair carries the previous surface.
+        setCalibrationRoute(payload.agent.session, `${routeFor(payload.agent).provider}/${routeFor(payload.agent).model}`)
+        const billed = lastRequestUsage(payload.agent.session)
+        calibrateRequestPair(payload.agent.session, billed?.tokens ?? 0, billed?.seq ?? 0, surfaceTokens(payload.agent.session))
+        // Hot-apply settings BEFORE any knob is read this step (issue #193): on
+        // the forms line, writes committed between steps land in our volatile
+        // refs with no event we receive — this re-read is what applies them.
+        engine.resyncSettings()
+        // Calling-convention gate BEFORE anything that renders model-facing copy:
+        // a PTC session must register `await tools.*` descriptions and nudge text,
+        // never the direct-call shape the host rejects (src/ptc.ts). Cheap — a
+        // marker scan over the session's system rows — and the heal below builds
+        // its definitions from `env`, so it must see the applied style.
+        const style = engine.resolveToolCallStyle(payload.agent.session)
+        if (style !== engine.appliedStyle) engine.applyToolCallStyle(style)
+        // Registration self-heal (src/registration.ts): `tools.register()` is a
+        // layer effect on the REGISTRY instance, so when the host rebuilds an
+        // agent realm the four ACP tools vanish while this plugin instance stays
+        // mounted — and the activation `done` guard forbids a second attempt.
+        // Live signature (2026-11-01): every model call answered `unknown tool`
+        // for the first two steps of a resumed session. Checking here (before
+        // `next()` builds the request) restores them within the SAME step, and
+        // runs regardless of `autoNudge` because a nudging-off session still
+        // needs the tools.
+        const healed = healRegistrations(env, ctx.get('tools'), ctx.get('commands'), payload.agent)
+        if (healed.tools.length > 0 || healed.command) {
+          ctx.logger.warn(
+            `billion-context-dsh: re-registered ${healed.tools.join(', ')}${healed.command ? ' + /acp-prune' : ''} on session ${payload.agent.session.id} — the host registry was rebuilt since activation`,
+          )
+        }
+      } catch (error) {
+        ctx.logger.warn(`billion-context-dsh: pre-step housekeeping failed (fail-open): ${String(error)}`)
       }
       if (!engine.readSettingsSource().autoNudge) return next()
       const decision = await next()
       if (decision.kind === 'reject') return decision
-      // Never append a nudge while a tool call of this step is still OPEN: the row would
-      // land BETWEEN the call and its result, which strict providers reject and which
-      // rule 8 used to resolve by deleting the real pair (round-8 review, named the
-      // ship-blocking bug at the source). One step later the results have landed and
-      // the same table is just as actionable — pressure never depends on this step.
-      if (openToolCallIds(payload.agent.session).size > 0) return decision
-      const window = await this.windowFor(payload.agent)
-      const outcome = buildNudge(
-        payload.agent,
-        {
-          ...env,
-          modelContextLimit: window.limit,
-          // Consumed here, not inside buildNudge: the note rides the nudge this
-          // step injects, and a step without a nudge must not silently spend it.
-          ptcLeakNote: engine.takePtcLeakNote(payload.agent.session),
-        },
-        this.lastNudgeTurn,
-        this.emergencyNudges,
-        () => {
-          // The kernel still wants an emergency nudge but the per-turn budget
-          // is spent: log WHY the model stops receiving nudges instead of
-          // letting the silence look like a bug (issue #108 review).
-          ctx.logger.warn(
-            `billion-context-dsh: emergency nudge suppressed — per-turn budget of ${EMERGENCY_NUDGE_MAX_PER_TURN} spent (session ${payload.agent.session.id}); pressure is still above the emergency threshold`,
-          )
-        },
-      )
-      if (outcome === null) return decision
-      return { kind: 'enter', messages: [...decision.messages, outcome.message] }
+      // B-1：nudge 构建同样 fail-open —— 拿不到压力/窗口/区间表时退回不加 nudge，
+      // 而不是让这一步直接失败。openToolCallIds 也在 try 内：它读 surface，同样的
+      // 失败模式（B-1 首版漏掉这一句，由 tests/pre-step-fail-open.test.ts 抓出）。
+      try {
+        // Never append a nudge while a tool call of this step is still OPEN: the row would
+        // land BETWEEN the call and its result, which strict providers reject and which
+        // rule 8 used to resolve by deleting the real pair (round-8 review, named the
+        // ship-blocking bug at the source). One step later the results have landed and
+        // the same table is just as actionable — pressure never depends on this step.
+        if (openToolCallIds(payload.agent.session).size > 0) return decision
+        const window = await this.windowFor(payload.agent)
+        const outcome = buildNudge(
+          payload.agent,
+          {
+            ...env,
+            modelContextLimit: window.limit,
+            // Consumed here, not inside buildNudge: the note rides the nudge this
+            // step injects, and a step without a nudge must not silently spend it.
+            ptcLeakNote: engine.takePtcLeakNote(payload.agent.session),
+          },
+          this.lastNudgeTurn,
+          this.emergencyNudges,
+          () => {
+            // The kernel still wants an emergency nudge but the per-turn budget
+            // is spent: log WHY the model stops receiving nudges instead of
+            // letting the silence look like a bug (issue #108 review).
+            ctx.logger.warn(
+              `billion-context-dsh: emergency nudge suppressed — per-turn budget of ${EMERGENCY_NUDGE_MAX_PER_TURN} spent (session ${payload.agent.session.id}); pressure is still above the emergency threshold`,
+            )
+          },
+        )
+        if (outcome === null) return decision
+        return { kind: 'enter', messages: [...decision.messages, outcome.message] }
+      } catch (error) {
+        ctx.logger.warn(`billion-context-dsh: nudge build failed (fail-open): ${String(error)}`)
+        return decision
+      }
     })
     // ── Context-overflow recovery (M5) ─────────────────────────────────
     // The seam rethrows a failed request unless a listener answers
@@ -875,7 +1030,7 @@ export class AcpCompactionEngine extends CompactionEngine {
     // automatic action: on a provider-confirmed CONTEXT_WINDOW_EXCEEDED the
     // engine emergency-compacts the largest eligible block (a durable,
     // model-free marker summary; originals stay in the log for
-    // search_context/decompress) and asks the loop to retry. Without this
+    // recall) and asks the loop to retry. Without this
     // listener the error was rethrown unretried.
     ctx.on('agent/status', ({ agent, status }) => {
       if (status !== 'idle') return
@@ -1174,7 +1329,7 @@ export class AcpCompactionEngine extends CompactionEngine {
    * engine-written marker summary. No LLM call — the provider just rejected
    * the request for being too large, so there is no model turn available to
    * write a summary; the originals stay in the append-only log, so
-   * search_context still indexes them, decompress restores them, and the
+   * recall still indexes and restores them, and the
    * model can re-run the compress tool over the marker later to write a real
    * summary. Returns null when nothing eligible exists (nothing to reclaim).
    */
@@ -1190,7 +1345,7 @@ export class AcpCompactionEngine extends CompactionEngine {
     // checkpoint node, so a snapshot taken before the loop could not see the surface the next
     // pass anchors on (round-12 review Q1). Deriving it once here as well only ran
     // `processTurn` a second time on the same unchanged surface for pass 0 (round-13 review
-    // Q1/Q3a); `renderTags: 'none'` means we read nothing but the ref map.
+    // Q1/Q3a); we read nothing but the ref map.
     const foldPricing = foldPricingFor(this.env)
     const minimumFold = Math.min(
       MIN_OVERFLOW_FOLD_TOKENS,
@@ -1219,7 +1374,7 @@ export class AcpCompactionEngine extends CompactionEngine {
       // (round-12 review Q1, both reviewers). `processTurn` is pure state-in/state-out, so
       // re-running it (at most OVERFLOW_FOLD_PASSES times, no LLM call) is the cheap fix.
       const messages = allLogMessages(session)
-      const passTurn = this.kernel.processTurn({ messages, state: this.store.stateFor(session), config, tokenCount, renderTags: 'none' })
+      const passTurn = this.kernel.processTurn({ messages, state: this.store.stateFor(session), config, tokenCount })
       const stateNow = passTurn.state
       this.store.set(session, stateNow)
       // One kernel range spanning the whole surface: buildCompressibleSeqRanges
@@ -1331,8 +1486,8 @@ export class AcpCompactionEngine extends CompactionEngine {
       if (startRef === undefined || endRef === undefined) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
       // Engine-written marker: the shared constructor in src/messages.ts is what
       // makes the projection net exempt it from the model-written frame, so the
-      // model-visible text and the durable/decompress text stay identical.
-      const summary = overflowMarkerSummary(best.count, provenance)
+      // model-visible text and the durable/recalled text stay identical.
+      const summary = overflowMarkerSummary(best.count, provenance, { startSeq: best.start, endSeq: best.end })
       const applied = this.kernel.applyCompression({
         ranges: [{ startRef, endRef, summary, topic: 'context-overflow recovery' }],
         messages,

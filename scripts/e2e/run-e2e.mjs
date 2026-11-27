@@ -1,10 +1,10 @@
 import { runScenario } from './harness.mjs'
+import { decodeSessionLog } from '../lib/zstd-frames.mjs'
 import { readFileSync, readdirSync, rmSync } from 'node:fs'
-import { zstdDecompressSync } from 'node:zlib'
 import { join } from 'node:path'
 import { assertReleasedEventPayload, assertReleasedV1Header } from '@deepseek-ai/dsh-session-format-v0-to-v1'
 import { foldSurface } from '@deepseek-ai/dsh-session'
-const scenarioNames = ['basic-compress', 'condense-handoff', 'condense-degraded', 'nudge-rhythm', 'compress-then-decompress', 'acp-status', 'overflow-recovery', 'jsonl-compress']
+const scenarioNames = ['basic-compress', 'condense-handoff', 'nudge-rhythm', 'compress-then-decompress', 'acp-status', 'overflow-recovery', 'jsonl-compress']
 const countsOf = (events) => {
   const starts = events.filter((event) => event.type === 'compaction/start').length
   const ends = events.filter((event) => event.type === 'compaction/end').length
@@ -122,8 +122,8 @@ const checksRhythm = (result) => {
 }
 const checksDecompress = (result) => {
   const list = checksBasic(result).slice()
-  list.push(['no new compaction events at decompress step', countsOf(result.events).starts === 1 && countsOf(result.events).ends === 1, `starts=${countsOf(result.events).starts}`])
-  list.push(['decompress result carries original text', containsOf(result.events, 'Note 0: the pruning section'), ''])
+  list.push(['no new compaction events at recall step', countsOf(result.events).starts === 1 && countsOf(result.events).ends === 1, `starts=${countsOf(result.events).starts}`])
+  list.push(['recall result carries original text', containsOf(result.events, 'Note 0: the pruning section'), ''])
   list.push(['compress result reports tier', containsOf(result.events, 'tier'), ''])
   return list
 }
@@ -254,13 +254,16 @@ const sessionFilesOf = (root) => {
 // write claim, so it coexists with the harness's (now disposed) writer.
 const storedEventsOf = async (result) => {
   const raw = []
+  // The 0.2.2 backend compresses by default, and it does so as CONCATENATED
+  // zstd frames (one per appended batch). A one-shot `zstdDecompressSync` over the
+  // whole file silently decodes only frame 0 — the header — which made every
+  // scenario report `0 rows` here while the file was perfectly fine. Always go
+  // through the shared multi-frame decoder (scripts/lib/zstd-frames.mjs).
+  let frames = 0
   for (const path of sessionFilesOf(result.persistRoot)) {
-    const bytes = readFileSync(path)
-    // The 0.2.2 backend compresses by default: zstd frame magic 28 B5 2F FD.
-    const text = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f && bytes[3] === 0xfd
-      ? zstdDecompressSync(bytes).toString('utf8')
-      : bytes.toString('utf8')
-    for (const line of text.split('\n')) {
+    const decoded = decodeSessionLog(readFileSync(path))
+    frames += decoded.frames
+    for (const line of decoded.text.split('\n')) {
       if (line.trim().length > 0) raw.push(JSON.parse(line))
     }
   }
@@ -276,7 +279,7 @@ const storedEventsOf = async (result) => {
     assertReleasedV1Header(header)
     for (const event of events) assertReleasedEventPayload(event, version)
   }
-  return { events, format: version }
+  return { events, format: version, frames, rows: raw.length }
 }
 // The retired V3 wrapper shape ({ kind: 'plugin', plugin: '<name>' }) is refused by
 // the V4-line writer outright ("format v4 message requires a producer-owned source
@@ -317,6 +320,13 @@ const checksPersistence = (result, storedLoad) => {
     ? 'persist: stored log decodes through the released codec'
     : `persist: stored log decodes line-by-line (format v${storedLoad.format}; admission enforced by the live writer)`
   list.push([codecLabel, true, `${stored.length} rows`])
+  // Regression anchor for the 2026-11-24 root cause: this log is CONCATENATED zstd
+  // frames, and a one-shot `zstdDecompressSync` decodes only frame 0 (the header),
+  // which made every scenario report `0 rows` behind a green codec line. A session
+  // log that yields no frame, or no line, is a decoder bug — never an empty run.
+  const frames = storedLoad.frames ?? 0
+  const lines = storedLoad.rows ?? 0
+  list.push(['persist: session log frame count', frames >= 1 && lines > 0, `${frames} frames, ${lines} lines`])
   const mismatch = firstRowMismatch(stored, result.events)
   list.push(['persist: stored rows equal live events (lossless round-trip)', mismatch === '', mismatch])
   const replayed = foldSurface(stored).nodes.map((node) => [node.seq, node.type])
@@ -387,7 +397,6 @@ const checksCondense = (result) => {
   list.push(['note weight gate accepted the note (a fold landed at all)', notes.length >= 1, `notes=${notes.length}`])
   list.push(['stored note carries Goal and Next', notes.some((t) => t.includes('## Goal') && t.includes('## Next')), `notes=${notes.length}`])
   list.push(['stored note is the model handoff text, not an engine summary', notes.some((t) => t.includes('E2E-CONDENSE-MARKER-7f3a')), ''])
-  list.push(['a compliant condense carries no degrade stamp', !notes.some((t) => t.includes('[dsh:degraded]')), ''])
   list.push(['election covered the oldest user turn', shadowedSeqsOf(result.events, result.seqs.U1), `U1=${result.seqs.U1}`])
   list.push(['durable replace node landed', surfaceOpOf(result.events), ''])
   list.push(['projection: handoff note present after the fold', projection.includes('E2E-CONDENSE-MARKER-7f3a'), ''])
@@ -397,25 +406,7 @@ const checksCondense = (result) => {
   return list
 }
 
-const checksCondenseDegraded = (result) => {
-  const list = []
-  const counts = countsOf(result.events)
-  const notes = overflowMarkersOf(result.events)
-  const projection = projectionAfterFirstTool(result.requests)
-  list.push(['engine folded even though every row strands the working set', counts.starts >= 1 && counts.ends === counts.starts, `starts=${counts.starts} ends=${counts.ends}`])
-  list.push(['the stored note carries the degrade stamp', notes.some((t) => t.includes('[dsh:degraded]')), `notes=${notes.length}`])
-  list.push(['the stamped note is still the model handoff text', notes.some((t) => t.includes('E2E-DEGRADED-MARKER-2b9c')), ''])
-  list.push(['a degraded note keeps Goal and Next', notes.some((t) => t.includes('## Goal') && t.includes('## Next')), `notes=${notes.length}`])
-  const resultTexts = result.events.filter((event) => event.type === 'tool/result').map((event) => JSON.stringify(event.data)).join(' ')
-  list.push(['the tool result quotes the degrade in this turn too', resultTexts.includes('DEGRADED election'), ''])
-  list.push(['election covered the oldest user turn', shadowedSeqsOf(result.events, result.seqs.U1), `U1=${result.seqs.U1}`])
-  list.push(['durable replace node landed', surfaceOpOf(result.events), ''])
-  list.push(['projection: stamped note present after the fold', projection.includes('E2E-DEGRADED-MARKER-2b9c'), ''])
-  list.push(['strict tool pairing in final request', wirePairing(result.requests), ''])
-  list.push(['conversation continued after end', continuationOf(result.events, lastEndSeq(result.events)), ''])
-  return list
-}
-const checksOf = { 'basic-compress': checksBasic, 'condense-handoff': checksCondense, 'condense-degraded': checksCondenseDegraded, 'nudge-rhythm': checksRhythm, 'compress-then-decompress': checksDecompress, 'acp-status': checksStatus, 'overflow-recovery': checksOverflow, 'jsonl-compress': checksJsonlCompress }
+const checksOf = { 'basic-compress': checksBasic, 'condense-handoff': checksCondense, 'nudge-rhythm': checksRhythm, 'compress-then-decompress': checksDecompress, 'acp-status': checksStatus, 'overflow-recovery': checksOverflow, 'jsonl-compress': checksJsonlCompress }
 const loadScenario = async (name) => {
   return JSON.parse(readFileSync(new URL(`./scenarios/${name}.json`, import.meta.url), 'utf8'))
 }

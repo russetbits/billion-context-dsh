@@ -209,6 +209,10 @@ export const AcpPluginConfigSchema = z.object({
   nudgeMaxContextLimitPct: markVolatile(z.number().min(0).max(1)),
   nudgeEmergencyThresholdPct: markVolatile(z.number().min(0).max(1)),
   autoNudge: markVolatile(z.boolean()),
+  // `disableBasic` deliberately stays OUT of this schema: it is a mount-time
+  // decision, and this field set is the public SETTINGS contract (exactly six
+  // volatile knobs — issue #193). It rides the raw composition row instead,
+  // like `prompts` / `coreOverrides` / `textOverrides` do.
 })
 
 /** What changed between two settings snapshots, and what the engine must do about it. */

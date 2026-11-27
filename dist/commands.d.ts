@@ -1,6 +1,6 @@
 /**
  * M4 — the `/acp-prune` slash command: a human-friendly window into the same
- * machinery the model tools expose (status, one-shot compress, decompress,
+ * machinery the model tools expose (status, one-shot compress, the block dump `recall` pages,
  * runtime settings read/write).
  * @module billion-context-dsh/commands
  */

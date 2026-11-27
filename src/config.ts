@@ -15,6 +15,7 @@
  */
 
 import { defaultConfig, type Config } from './kernel/index.ts'
+import type { TextOverrides } from './prompts.ts'
 import { DEFAULT_FOLD_FLOOR_PCT, KV_BLOCK_TOKENS, type FoldPricing } from './region.ts'
 
 /** The kernel-facing knobs shared by the nudge path and the compress tool. */
@@ -93,22 +94,25 @@ export const WORKING_SET_FLOOR_MIN_TOKENS = 8192
  * surface split that can never be folded again, so this arithmetic is biased
  * TOWARD the larger floor and the 16K choice is the conservative reading.
  */
+/**
+ * The number the condense CAPACITY gate uses: a fold whose remainder falls under
+ * `floorTokens` is refused (`condenseFloorRefusal` names the compliant move), and
+ * `force: true` is the operator's bypass. This is the ONLY gate — M-3 (2026-11-25)
+ * removed the other two (affordability, payback): they were never independently
+ * decisive on a live session and are guarded by the batch pricing instead.
+ * Capacity is the only one with experimental support (Appendix D of
+ * arXiv 2611.05306).
+ */
 export const WORKING_SET_FLOOR_MAX_TOKENS = KV_BLOCK_TOKENS
 
 /**
- * Smallest reclaim worth a permanent barrier once the election degrades below the
- * floor (cross-review Q5): a 1K fold buys 1K of relief for one surface split that
- * can never be folded again — the worst barrier-per-byte ratio possible.
+ * Retained PRICING annotations, no longer gates (M-3, 2026-11-25): the condense
+ * election applies the working-set floor alone. Payback (`foldCost / spanTokens`
+ * in requests) and re-prefill cost stay REPORTED — nudge range rows, condense
+ * result lines, provenance — so the model still sees the trade, but no ceiling
+ * refuses a fold for being a bad trade.
  */
-export const MIN_DEGRADED_FOLD_TOKENS = 4096
 
-// Round-3 added a fold-count gate here (ceil(limit / (2 × floor))) and round 4
-// deleted it: a barrier is a summary NOTE, not a floor-sized hole, so no fold
-// count measures the debt that formula claimed, and on a 32K window with a 16K
-// clamp the gate could never be reached at all — the deadlock it was meant to
-// open stayed closed. condenseDegradable (src/tools.ts) reads the live rows
-// instead: degrade only when NO eligible row can keep the floor, which needs no
-// measurement and can never fire early.
 export function foldPricingFor(input: KernelConfigInput): FoldPricing {
   const pct = input.foldFloorPct ?? DEFAULT_FOLD_FLOOR_PCT
   return {
@@ -142,4 +146,30 @@ export function kernelConfigFor(input: KernelConfigInput): Config {
     }
   }
   return defaultConfig(input.modelContextLimit, overrides)
+}
+
+/**
+ * `textOverrides` —— 按 id 整条替换模型可见文案(纯呈现层,不参与任何校验)。
+ *
+ * **替换,不是追加。** 覆盖值直接取代原文案,未列出的 id 保持英文默认。
+ * 这样一次覆盖的 token 成本 ≈ 原成本,配置不会变成"悄悄变贵"的渠道。
+ *
+ * **中文提示词不比英文省 token —— 恰恰相反。** 本插件的文案是英文的:
+ * 一段 600 字符的英文工具描述约 150 token;翻成同义的 300 个汉字约
+ * 300–450 token(估算口径:CJK 1 字/token、其余 4 字符/token),成本涨
+ * **1–3 倍**,而它每一轮请求都要重新计费。所以 `textOverrides` 的正确用法是
+ * **用更短的话说同样的事**,或者换一套口径;把它当"翻译开关"用,会让长会话
+ * 明显变慢变贵。超过默认值 1.5 倍的覆盖会得到一行 warning(不拒绝):
+ * 最容易踩的就是这个坑。
+ *
+ * 不接受覆盖的:note 骨架(`## Task`/`## Now`/…)与 kernel 内的文案 ——
+ * 前者是校验契约,后者不是本仓的资产。
+ */
+export interface TextOverrideConfig {
+  /**
+   * Override any built-in prompt string by id. Unlisted ids keep the English default.
+   * Ids come from `ableTextIds()` (`nudge.*`, `rangeTable.*`, `tool.*`, `systemPrompt`).
+   * A value REPLACES the default text — it is never appended.
+   */
+  readonly textOverrides?: TextOverrides
 }

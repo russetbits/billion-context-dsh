@@ -50,7 +50,7 @@ declare module '@deepseek-ai/dsh-llm' {
  * no ref (so no compress boundary), `anchorsRangeEdge` false (so the range
  * solver shrank past it and swallowed neighbours), invisible to the kernel's
  * recent/last-user protection (so the last real user turn could be compressed
- * away), priced at zero tokens, and absent from search/decompress output. The
+ * away), priced at zero tokens, and absent from recall output. The
  * host itself projects non-text references to deterministic handle text for
  * files ("request assembly projects every occurrence to deterministic handle
  * text", dsh-llm/lib/types/types.d.ts), and this is the same idea one layer
@@ -126,7 +126,7 @@ export declare function isEngineWrittenSummary(text: string): boolean;
  * The block summary the automatic overflow recovery writes. It is the engine's
  * own note — not model-written text, not user words — saying which range was
  * hidden to get the request under the window and where the originals still
- * live (the append-only log: search_context/decompress rebuild from it).
+ * live (the append-only log: recall rebuilds from it).
  */
 /**
  * Emergency marker summary. `provenance` is appended when present: a below-floor
@@ -216,7 +216,7 @@ export declare function isCheckpointNode(event: SessionEvent): boolean;
  * not a checkpoint node or carries no id — a malformed row still CLASSIFIES
  * as a checkpoint (it must never read as real content) but has no block to
  * link to. Single shared extractor for the ledger index (`summarySeqIndex`),
- * the distill-edge resolver (`blockRefForSummarySeq`) and the decompress
+ * the distill-edge resolver (`blockRefForSummarySeq`) and the recall
  * recursion (`checkpointBlockIdOf`) — those sites must not re-derive the shape
  * check themselves (issue #168).
  */

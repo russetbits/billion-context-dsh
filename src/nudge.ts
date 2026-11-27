@@ -24,6 +24,9 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AcpStateStore } from './state.ts'
 import { allLogMessages, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
 import {
+  MIN_CONDENSE_SPAN_TOKENS,
+  belowWorkingSetFloor,
+  blockRegistry,
   buildCompressibleSeqRanges,
   findOpenTurn,
   summarySeqOfKernelBlock,
@@ -128,6 +131,16 @@ function kernelRangeViewOf(nudge: NudgeDecision, state: CompressionState): Kerne
  * does not read "~0 tokens" as "nothing to reclaim" for a picture-heavy span
  * (issue #117). Counts, not prices: the price sits in the token column.
  */
+/**
+ * A-3：工具名指纹，渲染成 ` · tools: bash×12, read×5`；没有任何工具调用时返回
+ * 空串，整段不进行（`{tools}` 占位符落在行尾，空串即行尾无残留）。
+ */
+function toolsSuffixOf(range: SeqCompressibleRange): string {
+  if (range.tools.length === 0) return ''
+  const list = range.tools.map((tool) => `${tool.name}\u00d7${tool.count}`).join(', ')
+  return ` \u00b7 tools: ${list}`
+}
+
 function mediaSuffixOf(range: SeqCompressibleRange): string {
   if (range.images === 0 && range.files === 0 && range.spills === 0 && !range.belowFloor) return ''
   const parts: string[] = []
@@ -146,6 +159,112 @@ function mediaSuffixOf(range: SeqCompressibleRange): string {
   // column (`[tool X% | text Y%]`) and the one AGENTS.md rule 19 documents; a
   // comma inside the bracket reads as prose.
   return ` [${parts.join(' | ')}]`
+}
+
+/**
+ * A-9（2026-11-23）：批量口径汇总。
+ *
+ * 区间表每一行的 `fold ~N` 是「只折这一段要重读多少」，而折多段付的是同一笔
+ * （rewrite point 由最早那段决定，保留量反而更少）。实测 2026-11-23 的真机
+ * 区间表里，单段净收益全是负数（4426 − 46458），但把整片一起折却是 1.5 次请求
+ * 回本 —— 只列单段 fold 等于把模型劝退。这里给出并集收益、共用的一次性成本与
+ * 回本次数。
+ *
+ * `reclaimTokens` 取「不相交子集和」而不是简单相加：kernel 会给出不同粒度的
+ * 重叠区间（如 881..951 与 907..941），直接相加会高估收益。按 end 升序贪心选
+ * 不相交区间得到的是真实可折量的**下界**，对模型是安全的一侧。
+ * `foldCostTokens` 取 union 末段的 suffix 价 —— 批量折的 re-prefill 由最后一段
+ * 之后的内容决定，不是各行 fold 之和。
+ */
+export interface FoldPlan {
+  readonly rows: number
+  readonly reclaimTokens: number
+  /** 一次性成本 = 折后**保留下来的**那部分要重读多少（不是折掉的部分）。 */
+  readonly foldCostTokens: number
+  /** `foldCostTokens / reclaimTokens` — a REQUEST count, reported for display
+   *  (M-3: payback is no longer a gate; the capacity gate is the only one). */
+  readonly paybackRequests: number
+}
+
+/** 手写摘要的常驻成本。2026-11-25 随 doctrine 收紧为 Appendix-A 四件套简报，
+ *  从真机实测分布（s2115 n=56 / s5e5c n=33，p50 ~480t）重定为 400，
+ *  与 src/tools.ts 的 TYPICAL_HANDOFF_NOTE_TOKENS 保持同一依据。 */
+export const TYPICAL_NOTE_TOKENS = 400
+
+/**
+ * A-9 / M-1（2026-11-23~24）：批量折叠计划。
+ *
+ * 判定口径是**比例**，不是「压了有没有收益」这种二元问题：
+ *   保留下来的量 = suffix[start] − Σ(折掉) + note      ← 下一请求要重读的量
+ *   每请求收益   = Σ(折掉) − note
+ *   回本次数     = 保留量 / 每请求收益
+ * 只要 Σ 足够大，保留量就足够小，回本很快；反过来，表面尾部一段小内容虽然
+ * 重读成本接近 0，但也省不下多少。所以选段的标准是**回本次数最小**，而不是
+ * 「折得最多」或「成本最低」。
+ *
+ * `suffix[start]` 用 `foldCostTokens + tokens` 还原：`foldCostTokens` 是
+ * rewrite point（该段 end 之后）的价，加上该段自身的 tokens 正好是它 START
+ * 之后的全部可见量。
+ *
+ * 候选必须来自**全部**可压段（调用方不要先 slice），否则最优下界可能落在被
+ * 截掉的后半段里 —— 真机上最老 6 段恰好最碎、fold 价最高。
+ */
+export function foldPlanOf(
+  ranges: readonly SeqCompressibleRange[],
+  notesTokens: number = TYPICAL_NOTE_TOKENS,
+  pricing?: FoldPricing,
+): FoldPlan | null {
+  // 低于 floor 的段 compress/condense 都会拒（`belowWorkingSetFloor`），把它们算进
+  // 批量计划只会给出一份必被驳回的方案 —— 交叉评审 2026-11-24 指出新算法「取满」
+  // 会系统性偏向这种段。
+  const usable = ranges.filter((range) => !range.belowFloor)
+  if (usable.length === 0) return null
+  const ordered = [...usable].sort((a, b) => a.start - b.start)
+  const floor = pricing?.floorTokens
+  let best: { payback: number; reclaim: number; cost: number; set: SeqCompressibleRange[] } | null = null
+  for (let index = 0; index < ordered.length; index += 1) {
+    const head = ordered[index]!
+    // 从 head 起按 seq 升序贪心取互不相交的段：同一 head 下多折一段只增
+    // 收益、不增重读成本（它本来就在 suffix 里），所以取满是正确的。
+    const set: SeqCompressibleRange[] = []
+    let lastEnd = Number.NEGATIVE_INFINITY
+    for (let cursor = index; cursor < ordered.length; cursor += 1) {
+      const range = ordered[cursor]!
+      if (range.start <= lastEnd) continue
+      set.push(range)
+      lastEnd = range.end
+    }
+    const reclaim = set.reduce((sum, range) => sum + range.tokens, 0)
+    if (reclaim <= notesTokens) continue
+    // H1 (cross-review 2026-11-25): price the batch EXACTLY as the tool does —
+    // `foldCostTokens` is `suffix[last span end + 1]`, what the next request must
+    // re-prefill ONCE. The old head-relative `suffixAtStart - reclaim + notesTokens`
+    // was the NET KEPT size: on one 5-row batch it quoted 17314 while the tool billed
+    // 9541, and the footer called that number "one re-prefill". Two prices for one
+    // fold is the drift this change exists to remove.
+    const tail = set[set.length - 1]!
+    const cost = Math.max(0, tail.foldCostTokens)
+    // THE SAME gate `pickCondenseSpan` applies, on the BATCH's own numbers:
+    // the capacity (working-set floor) gate — M-3 (2026-11-25) removed the payback /
+    // cost ceilings as gates, so the recommendation here and the tool's verdict can
+    // no longer disagree on them.
+    const surfaceTotal = head.liveAfterFoldTokens + head.tokens
+    const kept = Math.max(0, surfaceTotal - reclaim - notesTokens)
+    if (reclaim < MIN_CONDENSE_SPAN_TOKENS) continue
+    if (belowWorkingSetFloor(surfaceTotal, kept, floor)) continue
+    const payback = cost / reclaim
+    if (best === null || payback < best.payback - 1e-9
+      || (Math.abs(payback - best.payback) < 1e-9 && reclaim > best.reclaim)) {
+      best = { payback, reclaim, cost, set }
+    }
+  }
+  if (best === null) return null
+  return {
+    rows: best.set.length,
+    reclaimTokens: best.reclaim,
+    foldCostTokens: Math.round(best.cost),
+    paybackRequests: best.payback,
+  }
 }
 
 /**
@@ -175,6 +294,22 @@ export function meterMediaPriceResolver(
  * `UPSTREAM:` workaround for kernel ref-map drift; that drift is fixed upstream
  * (acp-kernel #207) and the workaround is gone (rule 11).
  */
+/**
+ * `1.0` — the payback period in requests (`foldCost / tokens`), one decimal. `—` when the
+ * row removes nothing (a ratio against zero is meaningless, not infinite on screen).
+ *
+ * NOT the same function as `tools.ts:formatPayback` on purpose: that one feeds refuse/
+ * recommend COPY and returns `∞`, because "it never pays back" is the fact being stated;
+ * this one fills a TABLE CELL where a zero-span row simply has no ratio, so `—` is right
+ * and `∞` would read as a measured value. Keep both intents; do not merge them.
+ */
+function paybackTextOf(foldCostTokens: number, tokens: number): string {
+  if (tokens <= 0) return '—'
+  const value = foldCostTokens / tokens
+  if (!Number.isFinite(value)) return '—'
+  return (Math.round(value * 10) / 10).toFixed(1)
+}
+
 export function rangeTable(
   session: import('@deepseek-ai/dsh-session').Session,
   kernelView: KernelRangeView,
@@ -186,20 +321,44 @@ export function rangeTable(
   // `buildCompressibleSeqRanges` itself, so the six rows the model sees are six different
   // stretches of work AND every other caller sees the same deduped list — one source, no
   // second filter to drift out of sync (round-16 review Q2).
-  const ranges = buildCompressibleSeqRanges(
+  const allRanges = buildCompressibleSeqRanges(
     session,
     kernelView,
     {
       ...(mediaPriceOf === undefined ? {} : { mediaPriceOf }),
       // A row's price is the surface suffix after its END edge. The fixed request
-      // head sits BEFORE every rewrite point, so a warm cache reuses it and adding
+      // head sits BEFORE every rewrite point, so it is outside this price; adding
       // the paired overhead here double-counted it (round-10 review B1; the older
       // overhead-inclusive price still read ~2.8x under on a real fold).
       foldPricing,
     },
-  ).slice(0, 6)
+  )
   // 零范围:整块省略(保留现状的提前返回与 nudge 尾部 '\n')。
-  if (ranges.length === 0) return ''
+  if (allRanges.length === 0) return ''
+  // Cheapest rewrite point FIRST, not oldest first (cross-review 2026-11-24 G1).
+  // `foldCostTokens` is everything after the rewrite point, so ascending order is
+  // also the latest-first order: an earlier rewrite point re-reads more. The old
+  // `slice(0, 6)` on an oldest-first array showed the six MOST EXPENSIVE rows while
+  // the same payload's footer told the model to prefer the LATEST ones — the table
+  // and its own advice disagreed, and the model followed the table.
+  const ranges = [...allRanges]
+    .sort((a, b) => a.foldCostTokens - b.foldCostTokens || a.start - b.start)
+    .slice(0, 6)
+  // 计划只对**表里列出的**这几段求和：rows 与 reclaim 必须是模型看得见的东西。
+  // 用全量候选会算出「27 段一次折」这种表里根本没显示的承诺，指不出去就是误导。
+  // prefix fold 落地后 condense 折的是**最老的前缀**：它跨几段由 guard 与 floor
+  // 决定，与表里这 6 行不是同一个集合，所以 plan 仍然只按可见行计价——这行教的是
+  // content 路径的批量承诺，不是 condense 的跨度。
+  const plan = foldPlanOf(ranges, TYPICAL_NOTE_TOKENS, foldPricing)
+  // Barriers that a fragment surface strands. `blockRegistry` is log-derived (no surface
+  // write), so this stays a read-only computation.
+  const liveCarriers = blockRegistry(session).filter((entry) => entry.active && entry.summarySeq !== null).length
+  // The condition is "a plain batch cannot pass the gates", not "every row is tiny":
+  // rows can be large and still unreachable (a long protected tail makes every rewrite
+  // point too expensive), and in that case the cross-barrier fold is still the way out.
+  const obstacleLine = liveCarriers >= 2 && plan === null
+    ? [`obstacle: barriers ${liveCarriers}, no plain fold clears the working-set gate (each foldable stretch is under the ${MIN_CONDENSE_SPAN_TOKENS}t a note-carrying fold needs) \u2014 folding across the carriers is the only way forward: compress({ condense: { summary } }) folds them in ONE transaction (tier 2 \u2014 the originals behind those carriers become unrecoverable at message level, and the result says so).`]
+    : []
   const lines = ranges.map((range) =>
     renderTemplate(prompts.rangeTable.line, {
       start: range.start,
@@ -210,6 +369,13 @@ export function rangeTable(
       textPct: 100 - range.toolPct,
       media: mediaSuffixOf(range),
       foldCost: range.foldCostTokens,
+      // Payback period in REQUESTS: the re-prefill is paid once and the saving applies
+      // to every later request, so `cost / saving` is the number of requests after
+      // which the fold is ahead. Printed next to the cost because on a wide surface the
+      // cost column alone reads "this fold costs more than it saves" — which is exactly
+      // the misreading the payback number removes (the cost is one-time, the saving is not).
+      payback: paybackTextOf(range.foldCostTokens, range.tokens),
+      tools: toolsSuffixOf(range),
     }),
   )
   return [
@@ -218,6 +384,20 @@ export function rangeTable(
     renderTemplate(prompts.rangeTable.header, { surface: surfaceSummary(session) }),
     renderTemplate(prompts.rangeTable.title, { count: ranges.length }),
     ...lines,
+    ...(plan === null
+      ? []
+      : [renderTemplate(prompts.rangeTable.plan, {
+          rows: plan.rows,
+          reclaim: plan.reclaimTokens,
+          fold: plan.foldCostTokens,
+          payback: plan.paybackRequests.toFixed(1),
+        })]),
+    // A FRAGMENTED surface is a different failure from an expensive one: every gap is
+    // under the note-carrying minimum, so no plain fold can qualify no matter how long
+    // the model waits. The move that still works is folding ACROSS the carriers, which
+    // distils them (tier 2 — the originals behind them are gone). Advertised separately
+    // from the rows because it is NOT a row and must not be compared with one.
+    ...obstacleLine,
     prompts.rangeTable.footer,
   ].join('\n')
 }
@@ -228,6 +408,12 @@ export function rangeTable(
  * context-occupancy display, including fixed overhead). Falls back to
  * `tokenMeter.measure(session).surfaceTokens`, then `defaultCountTokens`
  * character heuristic for tests and minimal hosts.
+ */
+/**
+ * The token count driving pressure decisions (and, through `processTurn`, every
+ * range-row size the nudge prints). G1 口径注释（M-3）：这个数与 acp_status 的
+ * `Request input sizes` 行同源（同一 tokenCount 进 kernel 状态），都是估算——
+ * provider 侧 window 压力可能有出入，计费请求头才是权威。
  */
 function measuredTokenCount(agent: Agent, coreMessages: CoreMessage[]): number {
   return resolveTokenCount(agent, coreMessages)
@@ -309,10 +495,25 @@ export const EMERGENCY_NUDGE_MAX_PER_TURN = 3
  * emergency nudge but the per-turn budget is spent — the host uses it to log
  * why the model stops receiving nudges (issue #108 review).
  */
+/**
+ * Per-turn injection gate: WHICH turn the last normal nudge went out on, and at
+ * what pressure tier.
+ *
+ * B-2（2026-11-23）：记 turn 而不记档位，会让「同一个 turn 内档位的升级」被自己
+ * 吞掉 —— soft 档在 turn 开始时发一条，随后压力继续爬过 maxPct，真正的 hard
+ * 催促却因为 `lastNudgeTurn === turn` 直接 return。存档位后只有「同 turn 且档位
+ * 不升」才节流，升级仍能落地（acp-rs orchestrator.rs:532 同口径）。
+ */
+export interface NudgeGate {
+  readonly turn: number
+  /** 0 = soft（minPct 以上）、1 = hard（maxPct 以上）、2 = emergency。 */
+  readonly tier: number
+}
+
 export function buildNudge(
   agent: Agent,
   env: NudgeEnvironment,
-  lastNudgeTurn: Map<string, number>,
+  lastNudgeTurn: Map<string, NudgeGate>,
   emergencyNudges: Map<string, { turn: number; count: number }>,
   onEmergencyCapHit?: () => void,
 ): NudgeOutcome | null {
@@ -350,10 +551,19 @@ export function buildNudge(
   const emergency = nudge.breakdown?.emergencyOverride === 1
 
   const turnNumber = findOpenTurn(sessionEventsOf(session)) ?? 0
+  // Pressure tier for this nudge (B-2). `emergency` is the kernel's own override;
+  // otherwise hard = at or above the max threshold, soft = anything else that
+  // still earned an injection.
+  const limitTokens = env.modelContextLimit ?? 0
+  const tier = emergency
+    ? 2
+    : limitTokens > 0 && tokenCount / limitTokens >= (env.nudgeMaxContextLimitPct ?? 0.7) ? 1 : 0
   if (!emergency) {
-    // Normal-pressure nudge: at most one per user turn (unchanged behavior).
-    if (lastNudgeTurn.get(session.id) === turnNumber) return null
-    lastNudgeTurn.set(session.id, turnNumber)
+    // Normal-pressure nudge: at most one PER TIER per user turn. An escalation
+    // (soft → hard) still lands in the same turn; a repeat does not.
+    const gate = lastNudgeTurn.get(session.id)
+    if (gate !== undefined && gate.turn === turnNumber && gate.tier >= tier) return null
+    lastNudgeTurn.set(session.id, { turn: turnNumber, tier })
   } else {
     // Emergency nudge: bounded per user turn. Without this cap an unrelieved
     // ≥emergencyThreshold pressure re-injects a durable nudge on EVERY pre-step
@@ -370,6 +580,9 @@ export function buildNudge(
     } else {
       emergencyNudges.set(session.id, { turn: turnNumber, count: 1 })
     }
+    // Record the tier too, so a normal nudge cannot follow an emergency one in
+    // the same turn (the emergency budget already bounds its own repeats).
+    lastNudgeTurn.set(session.id, { turn: turnNumber, tier })
   }
 
   const style: ResolvedCallStyle = env.toolCallStyle ?? 'native'
@@ -479,40 +692,13 @@ function adaptKernelNudgeToSeq(
   // notice intact — it is a better prompt than an empty table.
   const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf, foldPricing)
   if (seqTable !== '') out = replaceRangesStr(out, seqTable)
-  out = insertContentFormNote(out, style)
+  // M-3: the kernel 💡 tip is replaced by the engine tip (which carries the
+  // two-shapes contract); a host that overrides nudge.tip keeps its own line.
+  if (prompts.nudge.tip !== '') out = replaceKernelTip(out, prompts.nudge.tip)
   // PTC: the kernel copy names the direct-call shape the host rejects, so the
   // rendered text (not the kernel templates — rule 9) switches to the SDK form.
   return ptcText(out, style)
 }
-
-/**
- * The kernel's batch tip (0.0.101) advertises TWO content forms — the array
- * form and a plain string ("most robust through lossy gateways"). This tool's
- * schema takes the array form only: our ref dialect is surface seqs, and
- * `content` must be `[{ startSeq, endSeq, summary }]`. Rather than rewrite the
- * kernel's copy (rule 9: the kernel owns the prompt), the engine states the
- * difference in ONE line, placed BEFORE the tip so the tip stays the last
- * thing the model reads. Without it a model that follows the tip gets a schema
- * rejection it has to re-learn from mid-batch.
- *
- * In PTC mode the SAME line must name the reachable shape (`await tools.compress`)
- * — the direct-call shape it otherwise teaches is the one the host rejects, and
- * the failure is silent there (the call parses as text), so the copy is the only
- * correction channel (src/ptc.ts).
- */
-function contentFormNote(style: ResolvedCallStyle): string {
-  return style === 'ptc'
-    ? 'Note: this tool takes the array form only — call it from inside `run_code` as `await tools.compress({ content: [{ startSeq, endSeq, summary }] })` with the surface seqs above; a plain-string content is rejected and a direct `compress` call fails.'
-    : 'Note: this tool takes the array form only — compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.'
-}
-
-/** Insert the array-form note right before the kernel's closing tip (no tip → text unchanged). */
-function insertContentFormNote(text: string, style: ResolvedCallStyle): string {
-  const tipAt = text.lastIndexOf('\n\n\u{1F4A1} ')
-  if (tipAt === -1) return text
-  return text.slice(0, tipAt) + '\n\n' + contentFormNote(style) + text.slice(tipAt)
-}
-
 
 /**
  * The rewrite-cost line: what the last compress cost in uncached input, and the
@@ -540,6 +726,20 @@ function replaceRangesStr(text: string, seqTable: string): string {
   // seqTable starts with '\n' (the range table's leading blank line), so
   // `before` + '\n' + seqTable yields one blank line before the table.
   return before + '\n' + seqTable + after
+}
+
+/**
+ * M-3 (2026-11-25): swap the KERNEL tip for the engine tip on the kernel path.
+ * The vendored kernel tip advertises a PLAIN-STRING content form our schema
+ * rejects (`ONE plain string holding every range`) and carries none of the
+ * two-shapes contract — the Note segment that used to correct it is gone (M-3
+ * merged it into the tip), so the kernel tip is REPLACED, not appended to. The
+ * engine tip (prompts.nudge.tip) carries the contract in one line.
+ */
+function replaceKernelTip(text: string, tip: string): string {
+  const at = text.lastIndexOf('\n\n\u{1F4A1} ')
+  if (at === -1 || tip === '') return text
+  return text.slice(0, at) + '\n\n' + tip
 }
 
 /** Replace the kernel tier trigger segment (`[TIER n …TRIGGER]…Example: compress(…)`) with our tier line. */
@@ -661,10 +861,12 @@ function renderNudgeFromTemplates(
     parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf, foldPricing))
   }
 
-  // Batch-compress tip (from kernel's nudge-text.ts style). The array-form
-  // note rides with it on this path too — a host that overrides only the tip
-  // must not lose the tool-contract line (same hole B6 closed for guidance).
-  if (prompts.nudge.tip !== '') parts.push('', contentFormNote(style), '', prompts.nudge.tip)
+  // Batch-compress tip (from kernel's nudge-text.ts style). M-3 (2026-11-25): the
+  // standalone Note segment is GONE — the tip itself carries the two-shapes contract
+  // (condense picks / content names, content must be an ARRAY), so the tail is ONE
+  // line instead of two overlapping ones. A host that overrides only the tip now
+  // owns the contract line wholesale (same hole B6 closed for guidance).
+  if (prompts.nudge.tip !== '') parts.push('', prompts.nudge.tip)
 
   // B6：模板路径同样摘掉哲学/规则段——否则宿主只要覆盖任一 nudge 槽位（如只改 tip），
   // 整份 6 KB 指引就会重新贴回来（独立复核 2026-09-08 发现的软缺口）。

@@ -7,7 +7,7 @@
  * as the shadow price, land the `user/message` surface replacement carrying the
  * summary under `compactCheckpointSource`, and release the lock with
  * `compaction/end`. The original events stay in the append-only log, so
- * decompress/search/status can rebuild everything from the log.
+ * recall/search/status can rebuild everything from the log.
  * @module billion-context-dsh/region
  */
 import type { Session, SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-session';
@@ -212,6 +212,16 @@ export interface SeqCompressibleRange {
     readonly tokens: number;
     /** Share of messages that are tool messages (tool-call or tool-result), 0-100 — kernel `toolPct` parity. */
     readonly toolPct: number;
+    /**
+     * Tool-call names in this run, most-called first, capped at `TOOL_NAME_LIMIT` (A-3).
+     * A cheap fingerprint of what the stretch actually did — the ONLY content signal
+     * a model gets when `condense` elects the span for it (A-1), so the summary it
+     * writes is not blind.
+     */
+    readonly tools: ReadonlyArray<{
+        readonly name: string;
+        readonly count: number;
+    }>;
     /** Image blocks reachable inside the span (directly or through a tool result). */
     readonly images: number;
     /** File blocks reachable inside the span. */
@@ -236,8 +246,8 @@ export interface SeqCompressibleRange {
      * Tokens the NEXT request must re-prefill ONCE after this replace lands.
      *
      * Everything AFTER the rewrite point and NOTHING else — the fixed request head
-     * (system prompt, tool registry) sits BEFORE every rewrite point, so a warm
-     * cache reuses it and adding the paired overhead double-counted it (rule 3 B1).
+     * (system prompt, tool registry) sits BEFORE every rewrite point, so it is
+     * outside this price and adding the paired overhead double-counted it (rule 3 B1).
      * Measured 2026-11-15 on the live host with a
      * real condense: prompt 125,665, reused 31,378 — the slot reuses the prompt
      * prefix only up to where the replace landed, and 31,378 is NOT a multiple of
@@ -266,6 +276,12 @@ export type MediaPriceOf = (seq: number) => number;
  * (reused 31,378 after a fold) post-fold reuse is the rewrite point's offset and
  * is NOT block-aligned, so nothing subtracts this from a fold price any more.
  */
+/**
+ * How many distinct tool names a range row carries (A-3). A stretch that called
+ * twelve tools is described by its top five — the tail is noise, and every name
+ * rides EVERY later request.
+ */
+export declare const TOOL_NAME_LIMIT = 5;
 export declare const KV_BLOCK_TOKENS = 16384;
 /**
  * How much of the window must stay LIVE after a fold.
@@ -383,7 +399,7 @@ export declare function deferCompressPairHide(session: Session, callId: string, 
  * gate, index.ts:137/:163 — presence+identity, not payload diff), so
  * compressing the newest row of a scope makes that file come straight back,
  * while compressing a STALE copy of the same file is silent. Live-audited
- * shape (session-f25e4fad): EVERY injection row — baseline and worktree —
+ * shape (a live session): EVERY injection row — baseline and worktree —
  * carries `source.changes[].scope` = `"<dir>\u0000<file>"` (root
  * `.\u0000AGENTS.md`, worktree `worktrees/<name>\u0000AGENTS.md`), which is
  * stable across config tweaks unlike `baselineIdentity`. Tail-scan the log,
@@ -477,6 +493,22 @@ export interface KernelRangeView {
         readonly byRef: Readonly<Record<string, string>>;
     };
 }
+/**
+ * Surface seqs the range table must never offer, in two roles: they are skipped
+ * when scanning a span AND they split it, because a span that reaches across
+ * one would shadow it. Three sources:
+ *
+ * - the recent tail (`preserveRecent`, default 5) — cheap protection for the
+ *   messages the current step is still working with;
+ * - the last REAL user turn (never an injected row — see `isRealUserTurn`);
+ * - the newest instruction row of every scope: the host re-injects the current
+ *   copy of an instruction file the moment it disappears from the surface, so
+ *   folding it reclaims nothing (rule 16);
+ * - the newest skill-catalog row: the host never re-sends a folded catalog
+ *   (resend keyed on the digest), so the visible copy must stay on the
+ *   surface (issue #185).
+ */
+export declare function protectedSurfaceSeqs(session: Session, preserve: number): Set<number>;
 /**
  * Compressible spans in the DSH seq dialect, for the nudge range table.
  *
@@ -580,14 +612,6 @@ export declare function liveCheckpointCarriersInSpan(session: Session, seqs: rea
 export declare function blockRefForSummarySeq(session: Session, seq: number): string | null;
 /** The durable compaction ids distilled by the given kernel block refs (`bN`). */
 export declare function compactionIdsOfKernelBlocks(session: Session, kernelBlockIds: readonly string[]): string[];
-/**
- * Resolve a kernel block ref (`bN`) — as shown by the model tool `acp_status`
- * (kernel `buildStatusReport` renders `block.blockId`) — to the durable
- * compaction id the decompress/search tools accept. Returns null when `bN` is
- * not an exact registry key (unknown ref). Only matches the canonical `bN`
- * form (`/^b\d+$/`); anything else is not a kernel ref and returns null so the
- * caller falls back to its compaction-id prefix match.
- */
 export declare function blockIdOfKernelRef(session: Session, kernelRef: string): string | null;
 /** The checkpoint summary seq of an ACTIVE kernel block (`bN`), or null. */
 export declare function summarySeqOfKernelBlock(session: Session, kernelBlockId: string): number | null;
@@ -599,7 +623,7 @@ export declare function summarySeqOfKernelBlock(session: Session, kernelBlockId:
  */
 export declare function expandShadowedSeqs(session: Session, blockId: string): number[];
 /**
- * Default decompress page size (#112): a block shadowing hundreds of
+ * Default page size for a recall block read (#112): a block shadowing hundreds of
  * messages used to be returned whole in ONE tool result — big enough to
  * flood the context window or get silently trimmed by the host's
  * tool-result pruner before the model ever saw the tail. One page per call
@@ -616,13 +640,13 @@ export declare function expandShadowedSeqs(session: Session, blockId: string): n
  */
 export declare const DEFAULT_DECOMPRESS_PAGE = 100;
 /**
- * Rendered-character budget per decompress page (#112). Kept below the host's
+ * Rendered-character budget per recall page (#112). Kept below the host's
  * tool-result pruner threshold (8192, docs/dsh-porting-analysis.md) with
  * headroom for the block header, the `[seq N]` prefixes, and the continue hint,
  * so a normal page survives intact instead of middle-trimmed. Deliberately NOT
  * tied to acp-kernel's `config.truncate.threshold`: that knob truncates a single
  * oversized tool output during compression, whereas the host pruner trims our
- * whole decompress result — different mechanisms, different thresholds.
+ * whole recall result — different mechanisms, different thresholds.
  */
 export declare const DEFAULT_DECOMPRESS_PAGE_CHARS = 7000;
 export interface DecompressPage {

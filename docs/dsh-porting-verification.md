@@ -15,7 +15,7 @@
 | 紧急 nudge 决策（usage ≥80% 注入） | ✅ |
 | `applyCompression` 建块（12 条消息压 5 条 → `blocksCreated:1, tokensCompressed:7255`） | ✅ |
 | 下一轮 `processTurn` 剪掉被覆盖消息（12 → 9 条，块活跃） | ✅ |
-| `decompress('b1')` 恢复块（含 summary） | ✅ |
+| `recall({ blockId: 'b1' })` 恢复块（含 summary；当时为 `decompress('b1')`） | ✅ |
 | `searchBlocks(docs, query, {limit})`（blockDocs + messageDocs 组合检索） | ✅ |
 
 证据要点：`compress`/`decompress`/`search`/`status` 等 API 全部 `export`（`dist/index.d.ts` 第 1–30 行），`CompressionCore` 接口（`processTurn`/`applyCompression`/`decompress`/`search`/`status`）是完整的纯函数内核，**无 host 依赖，可直接原样复用**。
@@ -49,10 +49,10 @@
 
 **结论：DSH 不存在（也不允许）Pi `context` 事件式的"内存改写消息再发"。** 移植必须接受 durable-surface 模型。
 
-### V5. decompress 可行性 ✅
+### V5. 反遮蔽（读回原文）可行性 ✅ —— 当时的 `decompress`，今 `recall` 的读形态
 
 - `session.events` 暴露完整 append-only 日志（deep-frozen，`index.ts:559`），`surface.ts` 明写 replace 只"遮蔽"：**"The model-visible surface deliberately shadows replaced ranges… durable source material; replacement copies stay model-only"**——被压缩的原始事件永远留在日志里。
-- 因此 DSH 原生实现 decompress = 读取日志中的原始事件 → 用 `surfaceOp: {op:'replace'}` 把 checkpoint 节点替换回原文。不需要 Pi 式的旁车状态。
+- 因此 DSH 原生的读回原文（当时的 `decompress`，今 `recall`）= 读取日志中的原始事件 → 用 `surfaceOp: {op:'replace'}` 把 checkpoint 节点替换回原文。不需要 Pi 式的旁车状态。
 - 附带收益：整个会话（含被压缩历史）天然可回放、可导出、可被 session-query 精确读取。
 
 ### V6. 新包构建/挂载机制 ✅
@@ -94,7 +94,7 @@ PROBE OK
   │     ├── acp-kernel CompressionCore（复用，V1 已验证）
   │     ├── agent/pre-step（pressure）+ agent/request-error（overflow）监听
   │     └── 自带/上游化 region 事务（V2 架构事实 1）
-  ├── 4 个模型工具：compress / decompress / search_context / acp_status（V3）
+  ├── 3 个模型工具：compress / recall / acp_status（V3；recall = 当时的 decompress + search_context）
   ├── /acp-prune 命令（V3）
   └── ACP 块状态持久化（日志事件 或 ctx.storage，V3/V5）
 ```
@@ -110,10 +110,10 @@ PROBE OK
 | --- | --- | --- |
 | D1 | **ref 机制**：放弃内存打 `<acp>` 标签，改用"seq 即 ref"，nudge/注入消息携带 seq→内容映射表 | V4：无内存改写钩子；V2 架构事实 4 |
 | D2 | **压缩落地**：模型 `compress` 工具 → durable `surfaceOp: {op:'replace'}` 遮蔽范围，摘要 = 模型写的 summary（正是 ACP 省 token 的卖点，无需二次 LLM 摘要调用） | V2、V5 |
-| D3 | **decompress**：读取日志原始事件，replace 回原文 | V5 |
+| D3 | **读原文**（今 `recall` 的 `blockId`/`seq` 形态）：读取日志原始事件，replace 回原文 | V5 |
 | D4 | **自动触发**：`agent/pre-step` + `agent/request-error`，与 compaction-basic 相同（压力侧只 nudge、不自动摘要；超窗侧已实现：引擎写 marker 摘要做一次紧急隐藏并让宿主重试，预算 `maxOverflowRetries`，PR #153） | V2 架构事实 2；docs/overflow-recovery-design.md |
 | D5 | **块状态**：ACP block 状态写成会话日志事件（如 `acp/block`，回放/checkpoint 免费）或 `ctx.storage` key | V5、V3 |
-| D6 | **搜索**：`search_context` 从日志重建统一文档集（块摘要 + 被遮蔽的原始消息），交给 acp-kernel `searchBlocks`（默认 hybrid：BM25 词干化 + CJK bigram + 字符 n-gram 模糊）；**信任内核**——引擎不设无命中闸门/阈值（曾有一版 BM25 闸门过滤 fuzzy 假阳性，实测误杀 6/46 条同义词与词干化查询，违反"算法归内核"原则后移除），评分直接呈现，弱命中（fuzzy 兜底分 ≈0.3 上下）由模型凭分数判断；消息命中回链最内层所属块 | V3、V1 |
+| D6 | **搜索**（今 `recall({ query })`）：从日志重建统一文档集（块摘要 + 被遮蔽的原始消息），交给 acp-kernel `searchBlocks`（默认 hybrid：BM25 词干化 + CJK bigram + 字符 n-gram 模糊）；**信任内核**——引擎不设无命中闸门/阈值（曾有一版 BM25 闸门过滤 fuzzy 假阳性，实测误杀 6/46 条同义词与词干化查询，违反"算法归内核"原则后移除），评分直接呈现，弱命中（fuzzy 兜底分 ≈0.3 上下）由模型凭分数判断；消息命中回链最内层所属块 | V3、V1 |
 | D7 | **nudge**：pre-step 注入（现有注入通道，会成为日志中的 `user/message`） | V4 中 pre-step 语义 |
 | D8 | **delegate 工具**：直接映射 DSH 现有 subagent/jobs 体系，不移植 Pi 专用实现 | 组合现状 |
 

@@ -24,8 +24,6 @@ import { createContentStore } from "./content-store.ts";
 import type { MessageContentStore } from "./content-store.ts";
 import { applyMessageFilters, listMessageFilters } from "./filter/index.ts";
 import { activeBlockSpans, resolveBlockSpan } from "./block-map.ts";
-import { createRenderRefsNode } from "./render-refs.ts";
-import type { RenderStrategy } from "./render-refs.ts";
 import {
   collectLatestProtected,
   hasMediaPayload,
@@ -91,19 +89,6 @@ export interface ProcessTurnInput {
   state: CompressionState;
   config: Config;
   tokenCount: number;
-  /**
-   * Which messages get an <acp> ref tag injected into their text
-   * (the render-refs pipeline node). Refs are ALWAYS assigned regardless
-   * (assign-refs node runs unconditionally).
-   *   - "all" (default): tag every mapped message — in-process hosts
-   *     like pai-acp want tags for the LLM to reference compress ranges.
-   *   - "text-only": tag only user/assistant text; leave tool-call args
-   *     and tool-result content pristine — proxy hosts where structured
-   *     content must not be polluted.
-   *   - "none": leave all text untouched — hosts that read the ref map
-   *     directly from result.state.messageRefs.
-   */
-  renderTags?: RenderStrategy;
   /** Per-session CCR content store (pass result.contentStore back here).
    *  Omit for pre-CCR sessions — an empty store is used. */
   contentStore?: MessageContentStore;
@@ -711,11 +696,9 @@ export function createCore(ports: Ports = {}): CompressionCore {
       state: input.state,
       effects: {},
     };
-    // Conversion (assign-refs) and rendering (render-refs) are separate
-    // concerns. Refs are always assigned; renderTags only controls which
-    // message texts receive an <acp> tag.
-    const strategy: RenderStrategy = input.renderTags ?? "all";
-    const nodes = buildNodes(strategy);
+    // Refs are ALWAYS assigned (the assign-refs node runs unconditionally);
+    // no node injects an <acp> tag into message text.
+    const nodes = defaultNodes();
     // #462: snapshot the raw inbound ids BEFORE any node runs — reconcile-
     // live-ids consumes the PREVIOUS pass's snapshot (echo continuity), and the
     // returned state carries THIS pass's snapshot for the next one.
@@ -782,15 +765,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
     };
   }
 
+  /** The pipeline node list. Each node owns ONE concern (see the section
+   *  below); nothing renders <acp> tags. */
   function defaultNodes(): PipelineNode[] {
-    return buildNodes("all");
-  }
-
-  /** Build the pipeline node list for a given render strategy. "none" omits
-   *  the render-refs node entirely; "all"/"text-only" append a render-refs
-   *  node bound to that strategy. */
-  function buildNodes(strategy: RenderStrategy): PipelineNode[] {
-    const base: PipelineNode[] = [
+    return [
       reconcileLiveIdsNode,
       assignRefsNode,
       syncBlocksNode,
@@ -805,8 +783,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
       nudgeNode,
       emergencyTruncateNode,
     ];
-    if (strategy === "none") return base;
-    return [...base, createRenderRefsNode(strategy)];
   }
 
   return {
@@ -822,9 +798,9 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
 // --- Pipeline nodes -------------------------------------------------------
 // Each node owns ONE concern. The ref map has a SINGLE writer (assignRefsNode);
-// tags are DERIVED at the end (renderRefsNode) — no dual source of truth, so
-// the old stripHallucinations band-aid is gone. Truncation is the LAST
-// token-reducing safety valve; render-refs is the final annotation pass.
+// nothing injects an <acp> tag into message text, so there is no second source
+// of truth and the old stripHallucinations band-aid is gone. Truncation is the
+// LAST token-reducing safety valve.
 
 const reconcileLiveIdsNode: PipelineNode = {
   name: "reconcile-live-ids",
@@ -1988,7 +1964,6 @@ function cloneState(state: CompressionState): CompressionState {
       byRaw: { ...state.messageRefs.byRaw },
       byRef: { ...state.messageRefs.byRef },
     },
-    tokenSnapshot: { ...(state.tokenSnapshot ?? {}) },
     nudge: { ...state.nudge, anchors: { ...state.nudge.anchors } },
     stats: { ...state.stats },
     absorbed: (state.absorbed ?? []).map((record) => ({ ...record })),

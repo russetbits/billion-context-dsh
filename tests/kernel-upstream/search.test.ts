@@ -2,7 +2,7 @@
 // Vendored from acp-kernel v0.0.29 (tests/search.test.ts) — imports migrated
 // from `../src/...` internals to the public `acp-kernel` entry.
 //
-// Regression layer for the engine's search_context path (src/tools.ts →
+// Regression layer for the engine's recall search path (src/tools.ts →
 // kernel searchBlocks, AGENTS.md rule 6): block/message doc building, role
 // weighting, result shape (ref/tokens/preview/blockId), algorithm selection,
 // hybrid quality (CJK segmentation, fuzzy gates, stemming) and the async

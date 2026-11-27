@@ -9,7 +9,7 @@
  * resumed later), the registry service is re-instantiated with empty layers
  * while THIS plugin instance stays mounted — so its eager registration is
  * already gone, and the activation-time `done` guard prevents any second
- * attempt. The measured signature (live session, 2026-11-01): the four ACP tools
+ * attempt. The measured signature (live session, 2026-11-01): the ACP tools
  * were absent from the tool surface for the first two steps after a resumed
  * session — every model call answered `unknown tool` — and reappeared only when
  * a fresh plugin instance mounted on step 3.
@@ -25,7 +25,7 @@ import { makeTools, type ToolEnvironment } from './tools.ts'
 import { acpCommand } from './commands.ts'
 
 /** The ACP surface the model needs; a step missing any of them is unusable. */
-export const ACP_TOOL_NAMES = ['compress', 'decompress', 'search_context', 'acp_status'] as const
+export const ACP_TOOL_NAMES = ['compress', 'recall', 'acp_status'] as const
 
 /** ACP slash command name (`/acp-prune`), healed on the same pass. */
 export const ACP_COMMAND_NAME = 'acp-prune'

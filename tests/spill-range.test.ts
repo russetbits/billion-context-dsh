@@ -115,7 +115,7 @@ test('the range table marks spilled rows and says they are re-readable', () => {
   const session = spillFixture('spill-row')
   const table = rangeTable(session, wholeSurfaceRangeView(session))
   assert.match(table, /\d+ spilled/, 'the row carries the spill mark')
-  assert.match(table, /readable from disk/, 'the footer states why the mark matters')
+  assert.match(table, /bytes on a FILE/, 'the footer states why the mark matters (M-3 wording)')
 })
 
 // Round-11 review Q3: a decorated wrapper (the pre-0.2.0 host shape) carries an UPPERCASE S
@@ -162,7 +162,7 @@ test('an undelimited wrapper and a decorated header quoting the key claim nothin
 // session id, a 12-char file stem) — not a path from any real machine.
 const PROSE_TAIL =
   'work line 1\nwork line 2\n\n[output truncated; full output: /tmp/dsh-subprocess-K3M7Q/dsh-subprocess-4217-2-9f3c1a7e5b02-stdout.log]\n\n' +
-  '(Omitted 48373 bytes. Full formatted result stored at: /tmp/dsh-spill-T8N2R/session-7c4e9b1a2d35/6a1f8d3c0b47-bash.txt. Use read with offset/limit, or grep this path to search within it.)'
+  '(Omitted 48373 bytes. Full formatted result stored at: /tmp/dsh-spill-T8N2R/session-SPILLTEST/6a1f8d3c0b47-bash.txt. Use read with offset/limit, or grep this path to search within it.)'
 
 function oneResult(id: string, text: string): Session {
   const session = Session.create(id)
@@ -181,7 +181,7 @@ test('the host prose notice marks a real spill on both of its forms', () => {
   const results = toolResults(oneResult('spill-prose', PROSE_TAIL))
   assert.deepEqual(
     spillPathsOfEvent(results[0]!),
-    ['/tmp/dsh-subprocess-K3M7Q/dsh-subprocess-4217-2-9f3c1a7e5b02-stdout.log', '/tmp/dsh-spill-T8N2R/session-7c4e9b1a2d35/6a1f8d3c0b47-bash.txt'],
+    ['/tmp/dsh-subprocess-K3M7Q/dsh-subprocess-4217-2-9f3c1a7e5b02-stdout.log', '/tmp/dsh-spill-T8N2R/session-SPILLTEST/6a1f8d3c0b47-bash.txt'],
     `both sentences name a file, so both must be collected: ${JSON.stringify(spillPathsOfEvent(results[0]!))}`,
   )
 })

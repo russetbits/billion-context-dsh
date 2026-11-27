@@ -7,7 +7,7 @@
  * as the shadow price, land the `user/message` surface replacement carrying the
  * summary under `compactCheckpointSource`, and release the lock with
  * `compaction/end`. The original events stay in the append-only log, so
- * decompress/search/status can rebuild everything from the log.
+ * recall/search/status can rebuild everything from the log.
  * @module billion-context-dsh/region
  */
 
@@ -212,10 +212,13 @@ function recoverStaleRange(session: Session, start: number, end: number): StaleR
     const failedEdge = eventAtOf(session, start) === undefined ? start : end
     return { kind: 'unresolvable', failedEdge }
   }
-  const liveInside = session.surface.nodes
-    .filter((seq) => seq >= start && seq <= end)
-    .sort((a, b) => a - b)
-  const plain = liveInside.filter((seq) => {
+  // Keep the SURFACE's positional order — never sort by seq value. The surface is
+  // locally non-monotonic after earlier replacements, so the numerically smallest
+  // surviving seq can sit AFTER the numerically largest one. Sorting by value made
+  // this function hand back an interval whose edges are reversed in position, and
+  // resolveSurfaceRange then threw `reversed range a..b` for two ascending seqs
+  // (live 2026-11-25: condense picked 5062..5697 and failed twice, deterministically).
+  const plain = session.surface.nodes.filter((seq) => seq >= start && seq <= end).filter((seq) => {
     const event = eventAtOf(session, seq)!
     return !isCheckpointNode(event) && !isSystemNode(event)
   })
@@ -596,7 +599,7 @@ export function runCompactionTransaction(
     // Engine-written summaries (the overflow marker) stay unframed because
     // `withSummaryFramePrefix` recognizes them by content — one rule shared with
     // the projection net in src/messages.ts, so what the model sees and what the
-    // decompress header reads back are the same bytes.
+    // recall's block header reads back are the same bytes.
     const framedSummary = prefixSummaryBlocks(input.summary)
     seqs.push(session.append('compaction/summary', {
       compactionId,
@@ -746,6 +749,13 @@ export interface SeqCompressibleRange {
   readonly tokens: number
   /** Share of messages that are tool messages (tool-call or tool-result), 0-100 — kernel `toolPct` parity. */
   readonly toolPct: number
+  /**
+   * Tool-call names in this run, most-called first, capped at `TOOL_NAME_LIMIT` (A-3).
+   * A cheap fingerprint of what the stretch actually did — the ONLY content signal
+   * a model gets when `condense` elects the span for it (A-1), so the summary it
+   * writes is not blind.
+   */
+  readonly tools: ReadonlyArray<{ readonly name: string; readonly count: number }>
   /** Image blocks reachable inside the span (directly or through a tool result). */
   readonly images: number
   /** File blocks reachable inside the span. */
@@ -770,8 +780,8 @@ export interface SeqCompressibleRange {
    * Tokens the NEXT request must re-prefill ONCE after this replace lands.
    *
    * Everything AFTER the rewrite point and NOTHING else — the fixed request head
-   * (system prompt, tool registry) sits BEFORE every rewrite point, so a warm
-   * cache reuses it and adding the paired overhead double-counted it (rule 3 B1).
+   * (system prompt, tool registry) sits BEFORE every rewrite point, so it is
+   * outside this price and adding the paired overhead double-counted it (rule 3 B1).
    * Measured 2026-11-15 on the live host with a
    * real condense: prompt 125,665, reused 31,378 — the slot reuses the prompt
    * prefix only up to where the replace landed, and 31,378 is NOT a multiple of
@@ -802,6 +812,13 @@ export type MediaPriceOf = (seq: number) => number
  * (reused 31,378 after a fold) post-fold reuse is the rewrite point's offset and
  * is NOT block-aligned, so nothing subtracts this from a fold price any more.
  */
+/**
+ * How many distinct tool names a range row carries (A-3). A stretch that called
+ * twelve tools is described by its top five — the tail is noise, and every name
+ * rides EVERY later request.
+ */
+export const TOOL_NAME_LIMIT = 5
+
 export const KV_BLOCK_TOKENS = 16384
 
 /**
@@ -826,6 +843,29 @@ export const DEFAULT_FOLD_FLOOR_PCT = 0.15
  * protecting a working set (a `?? 0` slip turning every range into belowFloor is
  * the footgun this predicate exists to close).
  */
+/**
+ * Smallest stretch a condense may fold: the smallest span that can carry a handoff note
+ * this host's models actually write inside the note-weight cap — `400 / 0.35`, rounded up
+ * (1143; 2026-11-25: `TYPICAL_HANDOFF_NOTE_TOKENS` re-measured at 400 after the doctrine
+ * moved to the Appendix-A four-field briefing — see src/tools.ts for the distribution).
+ * Moved here so the NUDGE can test the same number without importing the tool
+ * layer (tools.ts imports nudge.ts, so the reverse import would be a cycle). The two
+ * factors must stay equal to `TYPICAL_HANDOFF_NOTE_TOKENS` / `MAX_NOTE_WEIGHT_RATIO` in
+ * src/tools.ts — a test pins that equality so the pair cannot drift.
+ *
+ * F13 (cross-review 2026-11-25, accepted residual window): a span between
+ * 1143 and 4286 tokens can clear this election floor and then still be refused
+ * by the write-time gates — the weight gate (note > 35% of the span) bites up
+ * to `MAX_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO` = 1500/0.35 ≈ 4286t,
+ * above which the absolute note ceiling (1500t) keeps the ratio inside the cap
+ * instead. Accepting this window: the election floor must stay derivable from a
+ * NOTE-SIZE assumption (the weight gate's own arithmetic needs it), and a floor
+ * high enough to close the window entirely would also lock out spans a note CAN
+ * carry. The refusal names the compliant escape (an explicit `content` range),
+ * so the window costs one wasted condense turn, not a dead end.
+ */
+export const MIN_CONDENSE_SPAN_TOKENS = Math.ceil(400 / 0.35)
+
 export function belowWorkingSetFloor(totalTokens: number, liveAfterTokens: number, floor?: number): boolean {
   return floor !== undefined && floor > 0 && totalTokens > floor && liveAfterTokens < floor
 }
@@ -842,20 +882,30 @@ export function foldSpanPricing(
   startSeq: number,
   endSeq: number,
   pricing?: FoldPricing,
-): { readonly spanTokens: number; readonly liveAfterTokens: number; readonly belowFloor: boolean } {
+): {
+  readonly spanTokens: number
+  readonly liveAfterTokens: number
+  readonly belowFloor: boolean
+  /** Everything AFTER the span's end: what ONE fold re-prefills. */
+  readonly foldCostTokens: number
+} {
   const nodes = session.surface.nodes
   const suffix = surfaceSuffixTokens(session)
   const total = suffix[0] ?? 0
   const from = (nodes as readonly number[]).indexOf(startSeq)
   const to = (nodes as readonly number[]).indexOf(endSeq)
-  if (from < 0 || to < from) return { spanTokens: 0, liveAfterTokens: total, belowFloor: false }
+  if (from < 0 || to < from) {
+    return { spanTokens: 0, liveAfterTokens: total, belowFloor: false, foldCostTokens: 0 }
+  }
   const spanTokens = Math.max(0, total - (suffix[to + 1] ?? 0) + (suffix[from]! - total))
   const liveAfterTokens = Math.max(0, total - spanTokens)
   const floor = pricing?.floorTokens
+  const foldCostTokens = suffix[to + 1] ?? 0
   return {
     spanTokens,
     liveAfterTokens,
     belowFloor: belowWorkingSetFloor(total, liveAfterTokens, floor),
+    foldCostTokens,
   }
 }
 
@@ -876,6 +926,15 @@ export interface FoldPricing {
    * A row under it is flagged, and `condense` refuses it unless forced.
    */
   readonly floorTokens?: number
+  /**
+   * Ceiling on ONE fold's re-prefill, in tokens (see `foldCostTokens`). A fold
+   * costs `suffix[endIndex + 1]` ONCE and then removes those bytes from every later
+   * request. Retained for PRICING/PROVENANCE reporting only — M-3 (2026-11-25)
+   * removed it as a GATE: the condense election is guarded by the working-set
+   * floor alone (Appendix D, arXiv 2611.05306), the only gate with experimental
+   * support. Unset means nothing is configured.
+   */
+  readonly maxFoldCostTokens?: number
 }
 
 /**
@@ -913,7 +972,7 @@ function nodePriceOf(
  * row, or `hideSurfaceSeqs` turning one interior row into one PRUNE_NOTE tombstone
  * (rule 13 writes a VISIBLE user message, so the count survives). Length plus
  * lastSeq reads a clean hit there and serves stale suffix numbers, which is the
- * price the payback gate and the floor guard read. `surface.replaceGeneration`
+ * price report and the floor guard read. `surface.replaceGeneration`
  * advances on every replace, so it catches every in-place rewrite whatever the
  * host does to the array; the length/lastSeq checks stay because they are cheaper
  * than a stale generation read is worth arguing about. The callback stays in the
@@ -965,6 +1024,28 @@ function isToolEvent(event: SessionEvent): boolean {
   if (event.type !== 'assistant/message') return false
   const content = (event.data as { message?: { content?: unknown } }).message?.content
   return Array.isArray(content) && content.some((block) => (block as { type?: unknown })?.type === 'tool-call')
+}
+
+/**
+ * A-3（2026-11-23）：这一段里模型调过哪些工具。
+ *
+ * `condense` 由引擎选段（A-1），模型看不见候选的内容，只能盲写摘要；区间表
+ * 只有体积、tool/text 比例和 fold 价，回答不了「这段是读代码还是跑命令」。工具
+ * 名是区间内容最便宜的指纹（每个名字几个字节，比任何摘要都便宜），足以让模型
+ * 判断该不该折、以及摘要里要留住什么。
+ */
+function toolCallNamesOf(event: SessionEvent): string[] {
+  if (event.type !== 'assistant/message') return []
+  const content = (event.data as { message?: { content?: unknown } }).message?.content
+  if (!Array.isArray(content)) return []
+  const names: string[] = []
+  for (const block of content) {
+    const typed = block as { type?: unknown; name?: unknown }
+    if (typed?.type === 'tool-call' && typeof typed.name === 'string' && typed.name.length > 0) {
+      names.push(typed.name)
+    }
+  }
+  return names
 }
 
 // `isCheckpointNode` now lives in src/messages.ts (imported above) so the range
@@ -1525,7 +1606,7 @@ function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | nu
  *   (resend keyed on the digest), so the visible copy must stay on the
  *   surface (issue #185).
  */
-function protectedSurfaceSeqs(session: Session, preserve: number): Set<number> {
+export function protectedSurfaceSeqs(session: Session, preserve: number): Set<number> {
   const nodes = session.surface.nodes
   const protectedSeqs = new Set<number>()
   // `nodes.slice(-preserve)` would protect EVERYTHING when preserve is 0
@@ -1566,6 +1647,8 @@ interface CompressibleSegment {
   files: number
   /** Tool results whose overflow the host spilled to disk (re-readable). */
   spills: number
+  /** Tool-call names inside this run, in first-seen order (A-3). */
+  toolNames: Map<string, number>
 }
 
 /**
@@ -1643,6 +1726,7 @@ function compressibleSegmentsOf(
         images: attachments.images,
         files: attachments.files,
         spills,
+        toolNames: new Map(toolCallNamesOf(event).map((name) => [name, 1] as const)),
       }
     } else {
       current.start = Math.min(current.start, seq)
@@ -1653,6 +1737,9 @@ function compressibleSegmentsOf(
       current.spills += spills
       current.images += attachments.images
       current.files += attachments.files
+      for (const name of toolCallNamesOf(event)) {
+        current.toolNames.set(name, (current.toolNames.get(name) ?? 0) + 1)
+      }
     }
   }
   flush()
@@ -1752,6 +1839,10 @@ export function buildCompressibleSeqRanges(
           count: segment.count,
           tokens: segment.tokens,
           toolPct: segment.count > 0 ? Math.round((segment.toolCount / segment.count) * 100) : 0,
+          tools: [...segment.toolNames.entries()]
+            .map(([name, count]) => ({ name, count }))
+            .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+            .slice(0, TOOL_NAME_LIMIT),
           images: segment.images,
           files: segment.files,
           spills: segment.spills,
@@ -1959,20 +2050,47 @@ export function compactionIdsOfKernelBlocks(session: Session, kernelBlockIds: re
 /**
  * Resolve a kernel block ref (`bN`) — as shown by the model tool `acp_status`
  * (kernel `buildStatusReport` renders `block.blockId`) — to the durable
- * compaction id the decompress/search tools accept. Returns null when `bN` is
+ * compaction id the recall tool accepts. Returns null when `bN` is
  * not an exact registry key (unknown ref). Only matches the canonical `bN`
  * form (`/^b\d+$/`); anything else is not a kernel ref and returns null so the
  * caller falls back to its compaction-id prefix match.
  */
+/**
+ * Resolve a `bN` ref to ONE block when the kernel handed the same id to two
+ * blocks.
+ *
+ * This happens for real: a 61-block session measured 7 duplicated ids (b35, b36,
+ * b38, b47, b53 ...), each pair carrying adjacent summary seqs. The kernel
+ * assigns `bN` and our ledger only records what it was given, so the collision is
+ * upstream. `find()` silently returned whichever came first, which means
+ * `compress({ content: [{ startSeq: "b53" }] })` could distill a block the model
+ * did not mean — a wrong-but-plausible outcome, the worst kind.
+ *
+ * The rule is deterministic and matches what the model can see: prefer a summary
+ * that is still ON the surface (that is the one it was shown), and among those
+ * the newest. Only when none is visible fall back to the ledger order's newest.
+ */
+function pickKernelEntry(
+  session: Session,
+  kernelBlockId: string,
+): AcpBlockRegistryEntry | undefined {
+  const all = blockRegistry(session).filter((entry) => entry.kernelBlockId === kernelBlockId)
+  if (all.length <= 1) return all[0]
+  const surfaceSeqs = new Set<number>(session.surface.nodes as readonly number[])
+  const visible = all.filter((entry) => entry.summarySeq !== null && surfaceSeqs.has(entry.summarySeq))
+  const pool = visible.length > 0 ? visible : all
+  return pool.reduce((best, entry) =>
+    ((entry.summarySeq ?? -1) > (best.summarySeq ?? -1) ? entry : best))
+}
+
 export function blockIdOfKernelRef(session: Session, kernelRef: string): string | null {
   if (!/^b\d+$/.test(kernelRef)) return null
-  const entry = blockRegistry(session).find((r) => r.kernelBlockId === kernelRef)
-  return entry?.blockId ?? null
+  return pickKernelEntry(session, kernelRef)?.blockId ?? null
 }
 
 /** The checkpoint summary seq of an ACTIVE kernel block (`bN`), or null. */
 export function summarySeqOfKernelBlock(session: Session, kernelBlockId: string): number | null {
-  const entry = blockRegistry(session).find((r) => r.kernelBlockId === kernelBlockId)
+  const entry = pickKernelEntry(session, kernelBlockId)
   return entry?.active ? entry.summarySeq : null
 }
 
@@ -2012,7 +2130,7 @@ export function expandShadowedSeqs(session: Session, blockId: string): number[] 
 }
 
 /**
- * Default decompress page size (#112): a block shadowing hundreds of
+ * Default page size for a recall block read (#112): a block shadowing hundreds of
  * messages used to be returned whole in ONE tool result — big enough to
  * flood the context window or get silently trimmed by the host's
  * tool-result pruner before the model ever saw the tail. One page per call
@@ -2030,13 +2148,13 @@ export function expandShadowedSeqs(session: Session, blockId: string): number[] 
 export const DEFAULT_DECOMPRESS_PAGE = 100
 
 /**
- * Rendered-character budget per decompress page (#112). Kept below the host's
+ * Rendered-character budget per recall page (#112). Kept below the host's
  * tool-result pruner threshold (8192, docs/dsh-porting-analysis.md) with
  * headroom for the block header, the `[seq N]` prefixes, and the continue hint,
  * so a normal page survives intact instead of middle-trimmed. Deliberately NOT
  * tied to acp-kernel's `config.truncate.threshold`: that knob truncates a single
  * oversized tool output during compression, whereas the host pruner trims our
- * whole decompress result — different mechanisms, different thresholds.
+ * whole recall result — different mechanisms, different thresholds.
  */
 export const DEFAULT_DECOMPRESS_PAGE_CHARS = 7000
 

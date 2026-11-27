@@ -1,5 +1,5 @@
 /**
- * Regression tests for issue #133 — search_context latency degrading with
+ * Regression tests for issue #133 — recall search latency degrading with
  * block count (ms → ~20 min at 190 blocks / 13.3M shadowed tokens). The
  * plugin layer rebuilt the block ledger (B+1) × O(B·N) per search and
  * re-extracted the full search corpus on every call. Guards:

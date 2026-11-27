@@ -10,9 +10,11 @@
  * 94,287 non-reused tokens by ~2.8x.
  *
  * The honest price is therefore: everything AFTER the END edge and nothing before it —
- * the fixed request head (system prompt, tool registry) sits BEFORE every rewrite point
- * so a warm cache reuses it, while an injected row that landed AFTER the rewrite point
- * IS part of this price.
+ * the fixed request head (system prompt, tool registry) sits BEFORE every rewrite point,
+ * so it is outside this price, while an injected row that landed AFTER the rewrite point
+ * IS part of this price. Do NOT explain that boundary by cache reuse: a 2026-11-24 session
+ * on another provider reported 88,775,441 uncached input tokens against 0 cache read and
+ * 0 cache write, so how much the host reuses is not something this file knows.
  */
 
 import { test } from 'node:test'
@@ -99,7 +101,7 @@ test('the rewrite point IS a lever: an earlier fold is priced dearer', () => {
 })
 
 // The fixed request head (system prompt, tool registry, injected rows) sits BEFORE any
-// rewrite point, so a warm cache reuses it — charging it per fold double-counted it
+// rewrite point, so it is outside this price — charging it per fold double-counted it
 // and inflated the payback gate (round-10 review B1). Measured the same day: folds at
 // two folds at different rewrite points billed 51,122 uncached tokens in total afterwards
 // while the range table quoted ~92K for a row on that same surface.

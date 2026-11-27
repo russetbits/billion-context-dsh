@@ -165,10 +165,10 @@ function fakeExec(session: Session): ToolRunContext {
   } as unknown as ToolRunContext
 }
 
-async function statusText(env: ToolEnvironment, session: Session): Promise<string> {
+async function statusText(env: ToolEnvironment, session: Session, args: Record<string, unknown> = {}): Promise<string> {
   const tool = makeTools(env).find((definition) => definition.name === 'acp_status')
   assert.ok(tool, 'acp_status tool is registered')
-  const result = await tool.execute({}, fakeExec(session))
+  const result = await tool.execute(args, fakeExec(session))
   return (result as { text: string }).text
 }
 
@@ -436,4 +436,26 @@ test('#117: a mixed span row names both counts with the documented separator', (
   const table = rangeTable(session, view, DEFAULT_RESOLVED, () => 1500)
   assert.match(table, /\[\+1 image \| \+1 file\]/, 'the mixed row uses the documented ` | ` separator')
   assert.doesNotMatch(table, /\+1 image,/, 'the comma form is gone')
+})
+
+test('A-5: detail 一个词选中视图，scope/view 仍按旧写法工作', async () => {
+  const session = buildTextSession(8)
+  const env = makeEnv()
+  const compressed = await statusText(env, session, { detail: 'compressed' })
+  assert.match(compressed, /^COMPRESSED/m, 'detail:"compressed" reaches the block list')
+  assert.doesNotMatch(compressed, /CONTEXT BREAKDOWN/, 'and it is NOT the overview')
+  assert.doesNotMatch(compressed, /\nNudge: /, 'drilldown answers with the kernel report alone')
+  const visible = await statusText(env, session, { detail: 'visible' })
+  assert.match(visible, /^UNCOMPRESSED/m, 'detail:"visible" maps to scope:uncompressed + view:ranges')
+  const messages = await statusText(env, session, { detail: 'messages' })
+  assert.match(messages, /^UNCOMPRESSED/m, 'detail:"messages" maps to view:messages')
+  // 简化（2026-11-24）：scope/view 已从 schema 删除，模型面只剩 detail 一个入口。
+  const statusTool = makeTools(env).find((definition) => definition.name === 'acp_status')
+  const rawParams = (statusTool?.parameters ?? {}) as Record<string, unknown>
+  const params = Object.keys((rawParams.properties ?? rawParams) as Record<string, unknown>)
+  assert.ok(!params.includes('scope'), 'scope is no longer offered to the model')
+  assert.ok(!params.includes('view'), 'view is no longer offered to the model')
+  assert.ok(params.includes('detail'), 'detail is the one drilldown selector')
+  const overview = await statusText(env, session, {})
+  assert.match(overview, /CONTEXT BREAKDOWN/, 'no args = overview, unchanged')
 })

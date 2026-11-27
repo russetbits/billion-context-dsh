@@ -241,12 +241,15 @@ test('cross-checkpoint span: a PLAIN range that crosses a live checkpoint carrie
     execStub(session, 'call-checkpoint-plain-2'),
   )
   const text = (second as { text: string }).text
-  assert.match(text, /Compressed 0 block/)
-  assert.match(text, /still-active block/, 'the reject names the reason')
-  assert.match(text, /startSeq: "b1"/, 'the reject hands back the block-id call')
+  // Since 2026-11-25 a plain range that crosses a live carrier is CUT AROUND it
+  // instead of being refused: the kernel's #335 exclusion keeps the carrier
+  // visible, each surviving side becomes its own block, and the model gets its
+  // fold in THIS call instead of spending a turn re-cutting the range by hand.
+  assert.match(text, /Compressed 2 block\(s\) from 1 range \(split around 1 protected line\)/)
+  assert.match(text, /Excluded 1 checkpoint message/, 'the carrier is excluded from the span, not folded')
 
   const ledger = rebuildBlockLedger(session.snapshotEvents())
-  assert.equal(ledger.length, 1, 'no second block: the crossing span never landed')
+  assert.equal(ledger.length, 3, 'the first block plus one per surviving side')
   assert.ok(
     session.surface.nodes.includes(checkpointSeq as never),
     `the live carrier stays visible on the surface (seq ${checkpointSeq})`,
@@ -263,7 +266,7 @@ test('cross-checkpoint span: a PLAIN range that crosses a live checkpoint carrie
   )
 
   // Nothing is lost: the block still decompresses from the log.
-  const decompress = tool(env, 'decompress')
+  const decompress = tool(env, 'recall')
   const recovered = await decompress.execute({ blockId: ledger[0]!.blockId, inline: true } as never, exec)
   const recoveredText = (recovered as { text: string }).text
   assert.match(recoveredText, /a6|r8/, 'the superseded block\'s originals are still recoverable')
@@ -282,10 +285,10 @@ test('cross-checkpoint span: a PLAIN range that crosses a live checkpoint carrie
   assert.match(suggestedText, /Compressed 1 block/, 'the suggested block-id call lands')
   assert.match(suggestedText, /tier 2/, 'a block-id boundary distills instead of folding')
   const distilled = rebuildBlockLedger(session.snapshotEvents())
-  assert.equal(distilled.length, 2, 'the distill wrote its own block')
-  assert.equal(distilled[1]!.tier, 2)
+  assert.equal(distilled.length, 4, 'the split blocks plus the distill\'s own block')
+  assert.equal(distilled[3]!.tier, 2)
   assert.deepEqual(
-    [...distilled[1]!.parentBlockIds],
+    [...distilled[3]!.parentBlockIds],
     [ledger[0]!.blockId],
     'the distilled block records its parent',
   )
@@ -338,11 +341,14 @@ test('cross-checkpoint span: the carrier guard holds while the checkpoint is ins
     execStub(session, 'call-checkpoint-protected-2'),
   )
   const text = (second as { text: string }).text
-  assert.match(text, /Compressed 0 block/)
-  assert.match(text, /still-active block/, 'host protection and the carrier guard agree: refused, not folded')
+  // Host protection and the carrier exclusion now agree in a different way: the
+  // span is cut around the carrier, the side that lands INSIDE the recent window
+  // is refused by the kernel's own protected-zone rule, and the older side lands.
+  assert.match(text, /Compressed 1 block\(s\) from 1 range \(split around 1 protected line\)/)
+  assert.match(text, /entirely within the protected zone/, 'the protected side says why it did not land')
 
   const ledger = rebuildBlockLedger(session.snapshotEvents())
-  assert.equal(ledger.length, 1, 'the crossing span never landed')
+  assert.equal(ledger.length, 2, 'the first block plus the side outside the protection window')
   assert.ok(
     session.surface.nodes.includes(checkpointSeq as never),
     `the carrier is still visible (seq ${checkpointSeq})`,

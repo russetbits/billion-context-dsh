@@ -5,7 +5,7 @@ import { createCore, defaultCountTokens, type CompressionCore, type NudgeDecisio
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { AcpStateStore } from '../src/state.ts'
-import { buildNudge, buildNudgeText, computeSurfaceBreakdown, rangeTable, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN } from '../src/nudge.ts'
+import { buildNudge, buildNudgeText, computeSurfaceBreakdown, rangeTable, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type NudgeGate } from '../src/nudge.ts'
 import { makeTools, type ToolEnvironment } from '../src/tools.ts'
 import { rebuildBlockLedger, runCompactionTransaction } from '../src/region.ts'
 import { allLogMessages, eventsToCoreMessages, surfaceEventsOf } from '../src/messages.ts'
@@ -54,7 +54,7 @@ test('M4: buildNudge injects a compressible-range table under pressure', () => {
   // Small window + long history → the kernel recommends compression.
   const env = makeEnv(4000)
   const session = buildTextSession(12)
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   const emergencyNudges = new Map<string, { turn: number; count: number }>()
 
   const outcome = buildNudge(fakeAgent(session), env, lastNudgeTurn, emergencyNudges)
@@ -70,7 +70,7 @@ test('M4: a nudge is injected at most once per turn (dedup)', () => {
   // OVER-LIMIT line but below the 95% emergency threshold.
   const env = makeEnv(15000)
   const session = buildTextSession(12)
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   const emergencyNudges = new Map<string, { turn: number; count: number }>()
   const agent = fakeAgent(session)
 
@@ -78,13 +78,45 @@ test('M4: a nudge is injected at most once per turn (dedup)', () => {
   assert.ok(first !== null, 'first injection happens')
   assert.equal(first!.emergency, false, 'this is a normal-pressure nudge')
   assert.equal(buildNudge(agent, env, lastNudgeTurn, emergencyNudges), null, 'same turn is deduped')
-  assert.equal(lastNudgeTurn.get(session.id), 1, 'the turn was recorded')
+  assert.deepEqual(lastNudgeTurn.get(session.id), { turn: 1, tier: 1 }, 'the turn AND the tier were recorded (~83% = hard)')
+})
+
+test('B-2: a same-turn tier ESCALATION is not swallowed by the dedup gate', () => {
+  // 12 messages ≈ 12.4K of a 15K window = ~83%: above maxContextLimitPct (70%),
+  // below the 85% emergency line → a HARD nudge. The gate is pre-seeded with a
+  // SOFT one on the same turn, which is exactly what a soft nudge earlier in the
+  // turn would have left behind. Keying the dedup on the TURN alone (the old
+  // behavior) returned null here and the escalation never reached the model.
+  const env = makeEnv(15000)
+  const session = buildTextSession(12)
+  const lastNudgeTurn = new Map<string, NudgeGate>()
+  const emergencyNudges = new Map<string, { turn: number; count: number }>()
+  lastNudgeTurn.set(session.id, { turn: 1, tier: 0 })
+  const agent = fakeAgent(session)
+
+  const escalated = buildNudge(agent, env, lastNudgeTurn, emergencyNudges)
+  assert.ok(escalated !== null, 'the hard nudge lands despite a soft one earlier in the SAME turn')
+  assert.equal(escalated!.emergency, false, 'and it is still a normal (hard) nudge, not the emergency tier')
+  assert.equal(lastNudgeTurn.get(session.id)?.tier, 1, 'the gate now records hard')
+
+  assert.equal(buildNudge(agent, env, lastNudgeTurn, emergencyNudges), null, 'repeating the SAME tier is still deduped')
+})
+
+test('B-2: a same-turn DOWNGRADE is still deduped (a soft repeat adds nothing)', () => {
+  // The inverse guard: once hard went out in this turn, a soft-tier injection
+  // would be strictly less information for the same context.
+  const env = makeEnv(15000)
+  const session = buildTextSession(12)
+  const lastNudgeTurn = new Map<string, NudgeGate>()
+  const emergencyNudges = new Map<string, { turn: number; count: number }>()
+  lastNudgeTurn.set(session.id, { turn: 1, tier: 1 })
+  assert.equal(buildNudge(fakeAgent(session), env, lastNudgeTurn, emergencyNudges), null, 'hard already fired this turn')
 })
 
 test('M4: no nudge is produced for a comfortable context', () => {
   const env = makeEnv(128000)
   const session = buildTextSession(12)
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   assert.equal(buildNudge(fakeAgent(session), env, lastNudgeTurn, new Map()), null)
 })
 
@@ -98,7 +130,7 @@ test('M4: emergency nudges are capped per user turn (issue #108)', () => {
   // stays null.
   const env = makeEnv(1500)
   const session = buildTextSession(12)
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   const emergencyNudges = new Map<string, { turn: number; count: number }>()
   const agent = fakeAgent(session)
   let capHits = 0
@@ -124,7 +156,7 @@ test('M4: the emergency nudge cap resets on a new user turn (issue #108)', () =>
   // per-turn dedup).
   const env = makeEnv(1500)
   const session = buildTextSession(12)
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   const emergencyNudges = new Map<string, { turn: number; count: number }>()
   const agent = fakeAgent(session)
 
@@ -149,7 +181,7 @@ test('M4: a normal nudge does not consume the emergency budget (issue #108)', ()
   // +3 user messages = 15,490 → 96.8% (emergency).
   const env = makeEnv(16000)
   const session = buildTextSession(12)
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   const emergencyNudges = new Map<string, { turn: number; count: number }>()
   const agent = fakeAgent(session)
 
@@ -195,7 +227,7 @@ test('M4: buildNudge recommends tier-2 distillation when tier-1 blocks accumulat
   // the block still lands (covering 6..9).
   await compress.execute({ content: [{ startSeq: 6, endSeq: 10, summary: NUDGE_TIER_SUMMARY }] } as never, fakeExec(session))
 
-  const lastNudgeTurn = new Map<string, number>()
+  const lastNudgeTurn = new Map<string, NudgeGate>()
   const emergencyNudges = new Map<string, { turn: number; count: number }>()
   const outcome = buildNudge(fakeAgent(session), env, lastNudgeTurn, emergencyNudges)
   assert.ok(outcome !== null, 'distillable tier-1 blocks produce a tier-2 nudge')
@@ -383,4 +415,41 @@ test('M4: nudge contextBreakdown is wired to the surface (kernel path uses compu
   // No blocks → summaries is zero; text carries the alternating user/assistant plain text.
   assert.equal(bd.summaries, 0)
   assert.ok(bd.text > 0)
+})
+
+test('M4/P0-2: range table rows are ordered by rewrite-point cost ascending (= latest-first), and the render is deterministic', () => {
+  // P0-2 (paper-alignment §4): the table must NOT teach the model to fold the OLDEST,
+  // most re-read-heavy rows. The renderer sorts by `foldCostTokens` ascending —
+  // everything after the rewrite point is what the next request re-prefills, so the
+  // cheapest rewrite point IS the latest-first order, and it is the exact number the
+  // payback gate and `foldPlanOf` price the same rows with (one vocabulary, no drift).
+  // A "sort by seq descending" variant was rejected: it would optimise recency itself
+  // instead of the cost the gates actually charge, and `foldPlanOf`'s greedy prefix
+  // walk still needs seq order internally — the row ORDER the model reads is the
+  // presentation layer only.
+  // Tool pairs separated by AGENT-INSTRUCTION walls: a guarded row is never offered
+  // and always splits the range, so each tool pair becomes its own row with a
+  // DIFFERENT rewrite point (later rows are cheaper — that is the ordering under test).
+  const session = Session.create('range-table-order')
+  const wall = (digest: string): void => {
+    session.append('user/message', {
+      turn: 1, step: 1,
+      message: { role: 'user', content: [{ type: 'text', text: 'Instructions v' + digest + ': ' + longText('instr' + digest, 77) }], provider: 'test-provider', model: 'test-model' },
+      source: { kind: 'agent-instructions', form: 'instructions', baseline: true, changes: [{ action: 'set', scope: './\u0000AGENTS.md', path: 'AGENTS.md', digest }] },
+    } as never, { surfaceOp: 'append' })
+  }
+  for (let index = 1; index <= 4; index += 1) {
+    if (index > 1) wall('w' + index)
+    appendUser(session, longText('u' + index, index))
+    appendToolCall(session, longText('call' + index, index), 'call-' + index, index)
+    appendToolResult(session, longText('res' + index, index + 50), 'call-' + index, index)
+  }
+  const first = rangeTable(session, wholeSurfaceRangeView(session))
+  const second = rangeTable(session, wholeSurfaceRangeView(session))
+  assert.equal(first, second, 'the same surface renders the same plan twice — no jitter between nudges')
+  const costs = [...first.matchAll(/fold ~(\d+)/g)].map((match) => Number(match[1]))
+  assert.ok(costs.length >= 2, 'the fixture yields several rows: ' + first.split('\n').filter((line) => line.includes('seq ')).length)
+  for (let index = 1; index < costs.length; index += 1) {
+    assert.ok(costs[index]! >= costs[index - 1]!, 'row ' + index + ' is not cheaper than its predecessor: ' + costs.join(', '))
+  }
 })

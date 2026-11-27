@@ -163,7 +163,7 @@ export function buildStoredPlaceholder(input: StoredPlaceholderInput): string {
 }
 
 // Built from hex escapes: literal history-tag sequences in source get mangled
-// by content sanitizers upstream of git push (same reason render-refs.ts uses LT/GT).
+// by content sanitizers upstream of git push.
 const LEADING_TAG_RE = new RegExp("^\\x3cacp [^>]*>[^\\x3c]*\\x3c\\/acp>\\n?");
 
 export function stripLeadingTag(text: string): string {

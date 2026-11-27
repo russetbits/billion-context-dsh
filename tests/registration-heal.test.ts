@@ -147,8 +147,8 @@ test('a scope restriction is NOT a lost registration — the heal must not fight
   assert.deepEqual(tools.inserted, [])
   assert.equal(shouldRestoreTool(tools, agent, 'compress'), false)
   // A name gone from BOTH views is still restorable.
-  tools.global.delete('decompress')
-  assert.equal(shouldRestoreTool(tools, agent, 'decompress'), true)
+  tools.global.delete('recall')
+  assert.equal(shouldRestoreTool(tools, agent, 'recall'), true)
 })
 
 test('a registry that refuses the insert does not break the step', () => {
